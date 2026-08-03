@@ -56,6 +56,11 @@ compile-safe path (``forward_native`` by default; see
 :meth:`leave_torch_compile` restores the original dispatch. Both are
 idempotent because one module instance may be shared by many layers.
 
+An instance may replace its automatic order at runtime with
+:meth:`BaseFusedOp.set_priority`. This is intentionally an instance-level
+override: different model/operator plans can select different combinations of
+providers without mutating the class default or affecting other instances.
+
 Like the rest of ``sglang.kernels``, importing this module (and instantiating
 subclasses) never imports a kernel backend (``sgl_kernel`` /
 ``sglang.kernels.jit``), performs platform detection, or triggers JIT
@@ -74,10 +79,12 @@ from typing import (
     Callable,
     ClassVar,
     Dict,
+    Iterable,
     List,
     Mapping,
     Optional,
     Tuple,
+    Union,
 )
 
 import msgspec
@@ -111,6 +118,9 @@ BACKEND_METHODS: Dict[KernelBackend, str] = {
     KernelBackend.DEEPGEMM: "forward_deepgemm",
     KernelBackend.AITER: "forward_aiter",
     KernelBackend.TORCH_NPU: "forward_torch_npu",
+    KernelBackend.METAL_JIT: "forward_metal_jit",
+    KernelBackend.METAL_AOT: "forward_metal_aot",
+    KernelBackend.MLX: "forward_mlx",
 }
 
 _METHOD_BACKEND_LABELS: Dict[str, str] = {
@@ -128,6 +138,8 @@ DEFAULT_PRIORITY: Tuple[KernelBackend, ...] = (
     KernelBackend.CUTE_DSL,
     KernelBackend.AITER,
     KernelBackend.TORCH_NPU,
+    KernelBackend.METAL_AOT,
+    KernelBackend.METAL_JIT,
     KernelBackend.TRITON,
     KernelBackend.TORCH,
 )
@@ -352,7 +364,8 @@ class BaseFusedOp(nn.Module, ABC):
         Kernel-backend preference for auto-selection, best first. Defaults to
         :data:`DEFAULT_PRIORITY`. ``KernelBackend.TORCH`` entries are ignored:
         the native reference is always the final fallback, after
-        platform-specific forwards.
+        platform-specific forwards. Use :meth:`set_priority` to override the
+        class-level order for one operator instance.
     capabilities:
         Per-backend set of :class:`CapabilityRequirement` (OR semantics;
         an empty set value = runs on any device), consulted by
@@ -400,6 +413,74 @@ class BaseFusedOp(nn.Module, ABC):
         self._original_forward_method: Optional[Callable] = None
         self.is_torch_compile = False
         self._compiled_native = None
+
+        self._priority = self._normalize_priority(self.priority)
+
+    @staticmethod
+    def _normalize_priority(
+        priority: Union[
+            KernelBackend,
+            str,
+            Iterable[Union[KernelBackend, str]],
+        ],
+    ) -> Tuple[KernelBackend, ...]:
+        if isinstance(priority, KernelBackend):
+            values = (priority,)
+        elif isinstance(priority, str):
+            values = tuple(part.strip() for part in priority.split(",") if part.strip())
+        else:
+            try:
+                values = tuple(priority)
+            except TypeError as exc:
+                raise TypeError(
+                    "fused-op priority must be a backend or an iterable of backends"
+                ) from exc
+
+        normalized = []
+        seen = set()
+        for value in values:
+            try:
+                backend = value if isinstance(value, KernelBackend) else KernelBackend(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"unknown fused-op backend in priority: {value!r}"
+                ) from exc
+            if backend in seen:
+                raise ValueError(
+                    f"duplicate fused-op backend in priority: {backend.value!r}"
+                )
+            seen.add(backend)
+            normalized.append(backend)
+        return tuple(normalized)
+
+    def set_priority(
+        self,
+        priority: Optional[
+            Union[
+                KernelBackend,
+                str,
+                Iterable[Union[KernelBackend, str]],
+            ]
+        ],
+    ) -> None:
+        """Override this instance's automatic backend preference."""
+        normalized = self._normalize_priority(
+            self.priority if priority is None else priority
+        )
+        if priority is not None:
+            available = set(self.available_backends())
+            unavailable = tuple(backend for backend in normalized if backend not in available)
+            if unavailable:
+                names = ", ".join(repr(backend.value) for backend in unavailable)
+                raise ValueError(
+                    f"{self._op_label()}: priority backend(s) not implemented/"
+                    f"registered by this op: {names}"
+                )
+        self._priority = normalized
+
+    def get_priority(self) -> Tuple[KernelBackend, ...]:
+        """Return this instance's effective automatic backend order."""
+        return self._priority
 
     def _defined_method(self, method_name: str) -> Optional[Callable]:
         """The bound method if any class below ``BaseFusedOp`` defines it."""
@@ -453,6 +534,15 @@ class BaseFusedOp(nn.Module, ABC):
     # platform path exists exactly when a subclass defines it, and dispatch
     # falls back to forward_native otherwise. ---
 
+    def forward_metal_jit(self, *args, **kwargs):
+        raise NotImplementedError(f"{self._op_label()}: no Metal JIT backend")
+
+    def forward_metal_aot(self, *args, **kwargs):
+        raise NotImplementedError(f"{self._op_label()}: no Metal AOT backend")
+
+    def forward_mlx(self, *args, **kwargs):
+        raise NotImplementedError(f"{self._op_label()}: no MLX backend")
+
     # --- selection ---
 
     def available_backends(self) -> List[KernelBackend]:
@@ -488,7 +578,7 @@ class BaseFusedOp(nn.Module, ABC):
         the native reference is the final fallback after platform forwards.
         """
         candidates = []
-        for backend in self.priority:
+        for backend in self._priority:
             if backend is KernelBackend.TORCH:
                 continue
             if backend is KernelBackend.TORCH_COMPILE:
