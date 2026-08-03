@@ -97,7 +97,6 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
@@ -318,12 +317,8 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 if is_mps():
     CudaStreamContext = nullcontext
-    from sglang.srt.hardware_backend.mlx.scheduler_mixin import SchedulerMlxOverlapMixin
 else:
     from torch.cuda import StreamContext as CudaStreamContext
-
-    class SchedulerMlxOverlapMixin:
-        pass
 
 
 logger = logging.getLogger(__name__)
@@ -373,7 +368,6 @@ class Scheduler(
     SchedulerMultiplexMixin,
     SchedulerPPMixin,
     SchedulerDllmMixin,
-    SchedulerMlxOverlapMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
@@ -417,8 +411,7 @@ class Scheduler(
         self.enable_lora = server_args.enable_lora
         self.enable_lora_overlap_loading = server_args.enable_lora_overlap_loading
         self.max_loras_per_batch = server_args.max_loras_per_batch
-        self.enable_overlap = not server_args.disable_overlap_schedule and not use_mlx()
-        self.enable_overlap_mlx = not server_args.disable_overlap_schedule and use_mlx()
+        self.enable_overlap = not server_args.disable_overlap_schedule
         self.enable_pdmux = server_args.enable_pdmux
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
         self.stream_interval = server_args.stream_interval
@@ -895,14 +888,9 @@ class Scheduler(
         )
 
         # FIXME: move tp worker's init logic outside of the scheduler.
-        if use_mlx():
-            from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
+        from sglang.srt.managers.tp_worker import TpModelWorker
 
-            self.tp_worker = MlxTpModelWorker(**worker_kwargs)
-        else:
-            from sglang.srt.managers.tp_worker import TpModelWorker
-
-            self.tp_worker = TpModelWorker(**worker_kwargs)
+        self.tp_worker = TpModelWorker(**worker_kwargs)
 
     def maybe_init_draft_worker(self):
         if self.spec_algorithm.is_none():
@@ -1442,13 +1430,6 @@ class Scheduler(
                 self.draft_worker.get_confidence_budget_prepare()
             )
 
-        if use_mlx():
-            # MLX uses its own overlap loop and does not create CUDA streams,
-            # but the normal non-overlap scheduler path still relays decode
-            # input IDs through FutureMap.
-            self.result_queue: Deque = deque()
-            return
-
         # forward_stream_ctx / copy_stream are also used by PP (non-overlap)
         # via scheduler_pp_mixin; init unconditionally to match main.
         self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
@@ -1622,6 +1603,15 @@ class Scheduler(
     def release_host_resources(self) -> None:
         # Release pinned host buffers in userspace on graceful shutdown; see
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
+        # A platform plan may own compiled kernels and borrowed model/cache
+        # views. Fence and release those before tearing down their Torch owners.
+        for worker in (
+            getattr(self, "tp_worker", None),
+            getattr(self, "draft_worker", None),
+        ):
+            close_platform_operators = getattr(worker, "close_platform_operators", None)
+            if callable(close_platform_operators):
+                close_platform_operators()
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
         self.tree_cache.release_host_resources()
@@ -1638,13 +1628,6 @@ class Scheduler(
         # Triton kernel device-load is a lazy first-use at serving time.
         triton_load_watch.install()
         triton_load_watch.mark_serving_started()
-
-        if use_mlx():
-            # MLX overlap uses mx.async_eval for CPU/GPU overlap,
-            # not PyTorch MPS streams.
-            dispatch_event_loop(self)
-            return
-
         self.schedule_stream = self.device_module.Stream(priority=0)
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
@@ -2093,13 +2076,23 @@ class Scheduler(
             get_waiting_queue=lambda: self.waiting_queue,
             get_stats=lambda: self.metrics_reporter.stats,
             get_chunked_req=lambda: self.chunked_req,
-            get_disagg_prefill_bootstrap_queue=lambda: self.disagg_prefill_bootstrap_queue,
-            get_disagg_prefill_inflight_queue=lambda: self.disagg_prefill_inflight_queue,
+            get_disagg_prefill_bootstrap_queue=lambda: (
+                self.disagg_prefill_bootstrap_queue
+            ),
+            get_disagg_prefill_inflight_queue=lambda: (
+                self.disagg_prefill_inflight_queue
+            ),
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
-            get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
-            get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
-            get_total_prefill_uncached_tokens=lambda: self.total_prefill_uncached_tokens,
+            get_spec_total_num_accept_tokens=lambda: (
+                self.metrics_reporter.spec_total_num_accept_tokens
+            ),
+            get_spec_total_num_forward_ct=lambda: (
+                self.metrics_reporter.spec_total_num_forward_ct
+            ),
+            get_total_prefill_uncached_tokens=lambda: (
+                self.total_prefill_uncached_tokens
+            ),
             get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
             get_decode_moment_totals=lambda: self.decode_moment_totals,
         )
@@ -2122,7 +2115,6 @@ class Scheduler(
             is_generation=self.is_generation,
             disaggregation_mode=self.disaggregation_mode,
             enable_overlap=self.enable_overlap,
-            enable_overlap_mlx=self.enable_overlap_mlx,
             server_args=self.server_args,
             model_config=self.model_config,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -4237,6 +4229,10 @@ class Scheduler(
         ret["startup_time"] = self.startup_time
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
 
+        platform_operator_state = self.tp_worker.get_platform_operator_state()
+        if platform_operator_state is not None:
+            ret[f"{current_platform.device_type}_operator"] = platform_operator_state
+
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 
@@ -4844,8 +4840,6 @@ def dispatch_event_loop(scheduler: Scheduler):
             scheduler.event_loop_pdmux()
         elif server_args.pp_size > 1:
             scheduler.event_loop_pp()
-        elif scheduler.enable_overlap_mlx:
-            scheduler.event_loop_overlap_mlx()
         elif scheduler.enable_overlap:
             scheduler.event_loop_overlap()
         else:

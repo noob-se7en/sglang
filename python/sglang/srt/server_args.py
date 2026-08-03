@@ -54,7 +54,10 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
 )
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+from sglang.srt.hardware_backend.mps.runtime import (
+    validate_mps_model_config,
+    validate_mps_runtime,
+)
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.model_executor.cuda_graph_config import (
     ALLOWED_BACKENDS_PER_PHASE,
@@ -168,10 +171,6 @@ QUANTIZATION_CHOICES = [
     "quark",  # AMD Quark quantizer (FP8 / MXFP4 / Int4FP8 etc.)
     "quark_int4fp8_moe",
     "quark_mxfp4",  # Online MOE + linear quantization.
-    # Apple Silicon MLX backend — on-the-fly quantization of fp16 weights at load
-    # time via mlx.nn.quantize. Only takes effect when SGLANG_USE_MLX=1.
-    "mlx_q4",  # 4 bits, group_size=64 (mlx-community default)
-    "mlx_q8",  # 8 bits, group_size=64
     "unquant",
     "humming",
 ]
@@ -204,6 +203,7 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_amx",
     "ascend",
     "intel_xpu",
+    "mps",
 ]
 
 # Attention backends whose kernels read the chunked prefix-cache layout.
@@ -1184,7 +1184,7 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     device: A[
         Optional[str],
-        "The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu', 'musa'). Defaults to auto-detection if not specified.",
+        "The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu', 'musa', 'mps'). Defaults to auto-detection if not specified.",
         NS("device"),
     ] = None
     base_gpu_id: A[
@@ -3649,6 +3649,10 @@ class ServerArgs:
 
         materialize_declarations(self)
 
+        if self.device == "mps":
+            self._validate_mps_server_args()
+            self._validate_mps_resolved_model_config()
+
     def _handle_return_hidden_states_mode(self):
         if self.return_hidden_states_mode not in (None, "last", "full"):
             raise ValueError(
@@ -4186,11 +4190,13 @@ class ServerArgs:
             self.sampling_backend = "pytorch"
 
     def _handle_hardware_runtime_validation(self):
-        # This is intentionally independent of self.device: setting
-        # SGLANG_USE_MLX opts into the MLX backend and must fail immediately if
-        # the environment cannot honor that request. With the flag unset,
-        # use_mlx() remains lazy and does not import MLX.
-        use_mlx()
+        requested_device = getattr(self, "device", None)
+        explicitly_mps = requested_device is not None and (
+            str(requested_device).split(":", 1)[0] == "mps"
+        )
+        automatically_mps = requested_device is None and current_platform.is_mps()
+        if explicitly_mps or automatically_mps:
+            ServerArgs._validate_mps_server_args(self)
 
     def _handle_npu_backends(self):
         if self.device == "npu":
@@ -4208,8 +4214,127 @@ class ServerArgs:
 
     def _handle_mps_backends(self):
         if self.device == "mps":
-            if not use_mlx():
-                self.disable_overlap_schedule = True
+            self.disable_overlap_schedule = True
+            ServerArgs._validate_mps_server_args(self)
+
+    def _validate_mps_server_args(self):
+        """Fail before model loading for execution modes MPS cannot run."""
+
+        validate_mps_runtime()
+
+        supported_attention_backends = {None, "mps", "torch_native"}
+        for field in (
+            "attention_backend",
+            "prefill_attention_backend",
+            "decode_attention_backend",
+        ):
+            value = getattr(self, field, None)
+            normalized = getattr(value, "value", value)
+            normalized = None if normalized is None else str(normalized).lower()
+            if normalized not in supported_attention_backends:
+                raise ValueError(
+                    "Torch MPS currently supports only the mps or torch_native "
+                    f"attention backend; got {field}={value!r}"
+                )
+
+        sampling_backend = getattr(self, "sampling_backend", None)
+        normalized_sampling = getattr(sampling_backend, "value", sampling_backend)
+        normalized_sampling = (
+            None if normalized_sampling is None else str(normalized_sampling).lower()
+        )
+        if normalized_sampling not in {None, "pytorch"}:
+            raise ValueError(
+                "Torch MPS currently supports only the pytorch sampling backend; "
+                f"got sampling_backend={sampling_backend!r}"
+            )
+
+        kv_cache_dtype = str(getattr(self, "kv_cache_dtype", "auto")).lower()
+        if kv_cache_dtype not in {"auto", "bf16", "bfloat16"}:
+            raise ValueError(
+                "Torch MPS currently supports only auto/bf16 KV cache dtypes; "
+                f"got kv_cache_dtype={kv_cache_dtype!r}"
+            )
+
+        if envs.SGLANG_USE_HND_KVCACHE.get():
+            raise ValueError(
+                "Torch MPS currently requires the standard NHD KV cache; "
+                "SGLANG_USE_HND_KVCACHE=1 is unsupported"
+            )
+
+        if getattr(self, "dllm_algorithm", None) is not None:
+            raise ValueError(
+                "Torch MPS does not yet support DLLM execution; disable "
+                "--dllm-algorithm before launching"
+            )
+
+        disaggregation_mode = getattr(self, "disaggregation_mode", None)
+        if disaggregation_mode not in (None, "null"):
+            raise ValueError(
+                "Torch MPS does not yet support disaggregated serving; set "
+                "--disaggregation-mode null before launching"
+            )
+
+        if bool(getattr(self, "enable_multimodal", False)):
+            raise ValueError(
+                "Torch MPS multimodal serving is not yet validated; disable "
+                "--enable-multimodal before launching"
+            )
+
+        speculative_algorithm = getattr(self, "speculative_algorithm", None)
+        if speculative_algorithm is not None:
+            raise ValueError(
+                "Torch MPS does not yet support speculative decoding; disable "
+                "--speculative-algorithm before launching. The standard MPS "
+                "model path must not enter CUDA-only verification kernels."
+            )
+
+        enable_lora = getattr(self, "enable_lora", None)
+        lora_requested = enable_lora is True or (
+            enable_lora is None and bool(getattr(self, "lora_paths", None))
+        )
+        if lora_requested:
+            lora_backend = getattr(self, "lora_backend", "csgmv")
+            if lora_backend != "torch_native":
+                raise ValueError(
+                    "Torch MPS LoRA requires --lora-backend torch_native; "
+                    f"got lora_backend={lora_backend!r}. Triton/csgmv LoRA "
+                    "kernels are not valid on MPS."
+                )
+            if bool(getattr(self, "enable_lora_overlap_loading", False)):
+                raise ValueError(
+                    "Torch MPS does not yet support LoRA overlap loading; "
+                    "disable --enable-lora-overlap-loading"
+                )
+
+        if bool(getattr(self, "enable_torch_compile", False)):
+            raise ValueError(
+                "Torch MPS does not yet provide an SGLang torch.compile graph "
+                "runner; disable --enable-torch-compile. MLX compilation is "
+                "selected independently inside eligible MPS semantic operators."
+            )
+
+        quantization = getattr(self, "quantization", None)
+        if quantization not in (None, "unquant"):
+            raise ValueError(
+                "Torch MPS currently supports only unquantized model weights; "
+                f"got quantization={quantization!r}"
+            )
+
+        if (
+            getattr(self, "tp_size", 1) != 1
+            or getattr(self, "pp_size", 1) != 1
+            or getattr(self, "dp_size", 1) != 1
+        ):
+            raise ValueError(
+                "Torch MPS currently requires tp_size=1, pp_size=1, and dp_size=1"
+            )
+
+    def _validate_mps_resolved_model_config(self):
+        """Validate checkpoint-derived values after model config resolution."""
+        validate_mps_model_config(
+            self.get_model_config(),
+            lora_enabled=bool(getattr(self, "enable_lora", False)),
+        )
 
     def _handle_xpu_backends(self):
         if self.device == "xpu":
@@ -4422,8 +4547,10 @@ class ServerArgs:
             ),
             (
                 "OOT platform without piecewise support",
-                lambda: current_platform.is_out_of_tree()
-                and not current_platform.support_piecewise_cuda_graph(),
+                lambda: (
+                    current_platform.is_out_of_tree()
+                    and not current_platform.support_piecewise_cuda_graph()
+                ),
             ),
             (
                 "MoE A2A backend",
@@ -4434,14 +4561,18 @@ class ServerArgs:
             ("LoRA", lambda: bool(self.lora_paths) or self.enable_lora),
             (
                 "multimodal model",
-                lambda: self.get_model_config().is_multimodal
-                and not self.get_model_config().is_multimodal_piecewise_cuda_graph_supported,
+                lambda: (
+                    self.get_model_config().is_multimodal
+                    and not self.get_model_config().is_multimodal_piecewise_cuda_graph_supported
+                ),
             ),
             (
                 "GGUF quantization",
-                lambda: self.load_format == "gguf"
-                or resolved_view(self).quantization == "gguf"
-                or check_gguf_file(self.model_path),
+                lambda: (
+                    self.load_format == "gguf"
+                    or resolved_view(self).quantization == "gguf"
+                    or check_gguf_file(self.model_path)
+                ),
             ),
             ("DLLM (diffusion LLM)", lambda: self.dllm_algorithm is not None),
             (
@@ -4456,8 +4587,10 @@ class ServerArgs:
             ("symmetric memory", lambda: self.enable_symm_mem),
             (
                 "expert distribution recorder",
-                lambda: self.enable_eplb
-                or self.expert_distribution_recorder_mode is not None,
+                lambda: (
+                    self.enable_eplb
+                    or self.expert_distribution_recorder_mode is not None
+                ),
             ),
             (
                 "context parallel (attn_cp_size > 1)",
@@ -4496,8 +4629,10 @@ class ServerArgs:
             # indexer already splits eagerly.
             (
                 "MLA attention (non-DSA)",
-                lambda: self.use_mla_backend()
-                and not is_deepseek_dsa(self.get_model_config().hf_config),
+                lambda: (
+                    self.use_mla_backend()
+                    and not is_deepseek_dsa(self.get_model_config().hf_config)
+                ),
             ),
             # NemotronH's hybrid Mamba2 prefill is not BCG-safe: the mamba
             # state-track write is not wired into the captured buffers, so a
@@ -4515,8 +4650,10 @@ class ServerArgs:
             # CP all_gather replay size mismatch under BCG.
             (
                 "context parallel (attn_cp_size > 1)",
-                lambda: self._resolved().attn_cp_size > 1
-                and not supports_prefill_cp_bcg(self),
+                lambda: (
+                    self._resolved().attn_cp_size > 1
+                    and not supports_prefill_cp_bcg(self)
+                ),
             ),
             # Capture builds a dummy extend forward with attn_dcp_metadata=None.
             (
@@ -4530,14 +4667,18 @@ class ServerArgs:
             ),
             (
                 "unvalidated a2a backend",
-                lambda: resolved_view(self).moe_a2a_backend
-                not in ("none", "deepep", "megamoe", "flashinfer"),
+                lambda: (
+                    resolved_view(self).moe_a2a_backend
+                    not in ("none", "deepep", "megamoe", "flashinfer")
+                ),
             ),
             # Multimodal prefill replay faults under BCG; allowlisted archs opt back in.
             (
                 "multimodal model",
-                lambda: self.get_model_config().is_multimodal
-                and not self.get_model_config().is_multimodal_breakable_cuda_graph_supported,
+                lambda: (
+                    self.get_model_config().is_multimodal
+                    and not self.get_model_config().is_multimodal_breakable_cuda_graph_supported
+                ),
             ),
         ]
         for name, predicate in rules:
@@ -5742,8 +5883,8 @@ class ServerArgs:
                 return "trtllm_mha"
             elif is_hip():
                 return "aiter"
-            elif is_mps():
-                return "torch_native"
+            elif current_platform.is_mps():
+                return current_platform.get_default_attention_backend()
             else:
                 # FlashInfer does not support attention sinks.
                 if is_flashinfer_available() and not model_config.has_attention_sinks:
@@ -5762,8 +5903,8 @@ class ServerArgs:
                     return "aiter"
                 else:
                     return "triton"
-            elif is_mps():
-                return "torch_native"
+            elif current_platform.is_mps():
+                return current_platform.get_default_attention_backend()
             else:
                 return "triton"
 
@@ -5787,11 +5928,15 @@ class ServerArgs:
         # Split-backend override + default fill.
         run_post_process_pass(self, _attention_backend_default)
 
-        # Torch native and flex attention backends
+        # Torch native, MPS, and flex attention backends
         attention_backend = resolved_view(self).attention_backend
-        if attention_backend == "torch_native":
+        if attention_backend in {"mps", "torch_native"}:
+            backend_display_name = (
+                "MPS" if attention_backend == "mps" else "torch native"
+            )
             logger.warning(
-                "Cuda graph is disabled because of using torch native attention backend"
+                "Cuda graph is disabled because of using %s attention backend",
+                backend_display_name,
             )
             self.cuda_graph_config.decode.backend = Backend.DISABLED
             self.cuda_graph_config.prefill.backend = Backend.DISABLED
@@ -8002,13 +8147,12 @@ class ServerArgs:
     def _handle_unified_memory_pool(self):
         if not self.enable_unified_memory:
             return
-        assert self.disaggregation_mode == "null", (
-            "--enable-unified-memory is not yet compatible with PD " "disaggregation."
-        )
-        assert self.speculative_algorithm is None, (
-            "--enable-unified-memory is not yet compatible with speculative "
-            "decoding."
-        )
+        assert (
+            self.disaggregation_mode == "null"
+        ), "--enable-unified-memory is not yet compatible with PD disaggregation."
+        assert (
+            self.speculative_algorithm is None
+        ), "--enable-unified-memory is not yet compatible with speculative decoding."
         assert not (self.enable_hierarchical_cache or self.enable_lmcache), (
             "--enable-unified-memory is not yet compatible with hierarchical / "
             "host-tiered KV cache (--enable-hierarchical-cache / --enable-lmcache): "
@@ -8752,7 +8896,6 @@ class ServerArgs:
         # (or mamba_chunk_size if it is defined in the model's config) and page_size.
         # It is used to determine the caching point in a sequence during prefill.
         if not hasattr(self, "_mamba_cache_chunk_size"):
-
             try:
                 from sglang.kernels.ops.attention.fla.chunk_delta_h import (
                     CHUNK_SIZE as FLA_CHUNK_SIZE,
@@ -8987,6 +9130,9 @@ class ServerArgs:
             raise ValueError(
                 "--kv-canary-sweep-interval requires --kv-canary in {log, raise}"
             )
+
+        if self.device == "mps":
+            self._validate_mps_server_args()
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
