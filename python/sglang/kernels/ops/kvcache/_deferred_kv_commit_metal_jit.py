@@ -12,9 +12,7 @@ from functools import lru_cache
 
 import torch
 
-from sglang.kernels.ops.attention.qwen3_mps import QWEN3_06B_METAL_SPEC
 
-_QWEN3_NUM_LAYERS = 28
 _MAX_LAYERS_PER_LAUNCH = 14
 _THREADGROUP_WIDTH = 256
 
@@ -115,17 +113,6 @@ def _compile_library(
         head_dim=head_dim,
     )
     return compile_shader(source), chunks
-
-
-def warmup_qwen3_kv_commit(*, pool_slots: int) -> None:
-    library, chunks = _compile_library(
-        pool_slots,
-        _QWEN3_NUM_LAYERS,
-        QWEN3_06B_METAL_SPEC.num_kv_heads,
-        QWEN3_06B_METAL_SPEC.head_dim,
-    )
-    for name, _, _ in chunks:
-        getattr(library, name)
 
 
 def _require_bf16_contiguous(name: str, tensor: torch.Tensor) -> None:
@@ -272,28 +259,7 @@ def verify_deferred_kv_commit(
         torch.mps.synchronize()
 
 
-def qwen3_commit_deferred_kv(
-    new_k: torch.Tensor,
-    new_v: torch.Tensor,
-    slots: torch.Tensor,
-    k_pools: list[torch.Tensor] | tuple[torch.Tensor, ...],
-    v_pools: list[torch.Tensor] | tuple[torch.Tensor, ...],
-) -> None:
-    """Compatibility wrapper for the original Qwen3-0.6B entry point."""
-    commit_deferred_kv(
-        new_k,
-        new_v,
-        slots,
-        k_pools,
-        v_pools,
-        num_kv_heads=QWEN3_06B_METAL_SPEC.num_kv_heads,
-        head_dim=QWEN3_06B_METAL_SPEC.head_dim,
-    )
-
-
 __all__ = [
     "commit_deferred_kv",
-    "qwen3_commit_deferred_kv",
     "verify_deferred_kv_commit",
-    "warmup_qwen3_kv_commit",
 ]

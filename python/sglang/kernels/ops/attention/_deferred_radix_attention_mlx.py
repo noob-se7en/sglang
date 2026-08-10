@@ -1,4 +1,7 @@
-"""Deferred-commit Qwen3-0.6B decode attention for an MLX island.
+"""Deferred-commit GQA radix attention for an MLX island.
+
+Kernels are templated per :class:`DeferredAttentionSpec` (query/KV head
+counts and head dim), so any uniform-GQA softmax model shares this module.
 
 This module deliberately has an MLX-array contract.  A caller may borrow the
 Torch-owned Radix KV pool through :class:`MlxTensorView`, run the complete MLX
@@ -20,7 +23,6 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import mlx.core as mx
 
-from sglang.kernels.ops.attention.qwen3_mps import QWEN3_06B_METAL_SPEC
 
 _DECODE_NUM_THREADS = 1024
 _SIMD_SIZE = 32
@@ -50,7 +52,7 @@ def _kernel_header(spec) -> str:
 #define VALUES_PER_LANE (HEAD_DIM / SIMD_SIZE)
 #define ATTENTION_SCALE {spec.attention_scale:.12g}f
 
-inline float qwen3_simd_max_32(float value) {{
+inline float radix_simd_max_32(float value) {{
   value = max(value, simd_shuffle_xor(value, ushort(16)));
   value = max(value, simd_shuffle_xor(value, ushort(8)));
   value = max(value, simd_shuffle_xor(value, ushort(4)));
@@ -58,7 +60,7 @@ inline float qwen3_simd_max_32(float value) {{
   return max(value, simd_shuffle_xor(value, ushort(1)));
 }}
 
-inline float qwen3_simd_sum_32(float value) {{
+inline float radix_simd_sum_32(float value) {{
   value += simd_shuffle_xor(value, ushort(16));
   value += simd_shuffle_xor(value, ushort(8));
   value += simd_shuffle_xor(value, ushort(4));
@@ -137,7 +139,7 @@ for (long token = long(warp);
         : float(k_pool[kv_base + dimension]);
     logit += query_values[index] * key_value;
   }
-  logit = qwen3_simd_sum_32(logit);
+  logit = radix_simd_sum_32(logit);
 
   const float new_max = max(local_max, logit);
   const float old_scale = metal::fast::exp(local_max - new_max);
@@ -163,14 +165,14 @@ threadgroup_barrier(mem_flags::mem_threadgroup);
 // Every simdgroup performs the same 32-way state merge.  Lane N represents
 // partial state N, so its scale can be reused for all four output components.
 const float partial_max = partial_maxes[lane];
-const float row_max = qwen3_simd_max_32(partial_max);
+const float row_max = radix_simd_max_32(partial_max);
 const bool row_has_tokens = row_max != -INFINITY;
 const float partial_scale =
     row_has_tokens && partial_max != -INFINITY
     ? metal::fast::exp(partial_max - row_max)
     : 0.0f;
 const float row_sum = row_has_tokens
-    ? qwen3_simd_sum_32(partial_sums[lane] * partial_scale)
+    ? radix_simd_sum_32(partial_sums[lane] * partial_scale)
     : 0.0f;
 
 float merged_values[VALUES_PER_LANE];
@@ -181,7 +183,7 @@ for (uint index = 0; index < VALUES_PER_LANE; ++index) {
   partial_outputs[lane * NUM_SIMDGROUPS + warp] =
       local_accumulators[index];
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  const float numerator = qwen3_simd_sum_32(
+  const float numerator = radix_simd_sum_32(
       partial_outputs[warp * SIMD_SIZE + lane] * partial_scale);
   merged_values[index] = row_sum == 0.0f ? 0.0f : numerator / row_sum;
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -292,7 +294,7 @@ for (long token = long(warp);
         : float(k_pool[kv_base + dimension]);
     logit += query_values[index] * key_value;
   }
-  logit = qwen3_simd_sum_32(logit);
+  logit = radix_simd_sum_32(logit);
 
   const float new_max = max(local_max, logit);
   const float old_scale = metal::fast::exp(local_max - new_max);
@@ -316,21 +318,21 @@ if (lane == 0) {
 threadgroup_barrier(mem_flags::mem_threadgroup);
 
 const float partial_max = partial_maxes[lane];
-const float row_max = qwen3_simd_max_32(partial_max);
+const float row_max = radix_simd_max_32(partial_max);
 const bool row_has_tokens = row_max != -INFINITY;
 const float partial_scale =
     row_has_tokens && partial_max != -INFINITY
     ? metal::fast::exp(partial_max - row_max)
     : 0.0f;
 const float row_sum = row_has_tokens
-    ? qwen3_simd_sum_32(partial_sums[lane] * partial_scale)
+    ? radix_simd_sum_32(partial_sums[lane] * partial_scale)
     : 0.0f;
 
 float merged_values[VALUES_PER_LANE];
 for (uint index = 0; index < VALUES_PER_LANE; ++index) {
   partial_outputs[lane * NUM_SIMDGROUPS + warp] = local_accumulators[index];
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  const float numerator = qwen3_simd_sum_32(
+  const float numerator = radix_simd_sum_32(
       partial_outputs[warp * SIMD_SIZE + lane] * partial_scale);
   merged_values[index] = row_sum == 0.0f ? 0.0f : numerator / row_sum;
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -646,73 +648,8 @@ def radix_prefill_deferred(
     )[0]
 
 
-def qwen3_radix_decode_deferred(
-    q: mx.array,
-    current_k: mx.array,
-    current_v: mx.array,
-    k_pool: mx.array,
-    v_pool: mx.array,
-    req_to_token: mx.array,
-    req_pool_indices: mx.array,
-    seq_lens: mx.array,
-    *,
-    scale: float = QWEN3_06B_METAL_SPEC.attention_scale,
-) -> mx.array:
-    """Compatibility wrapper for the original Qwen3-0.6B entry point."""
-    return radix_decode_deferred(
-        q,
-        current_k,
-        current_v,
-        k_pool,
-        v_pool,
-        req_to_token,
-        req_pool_indices,
-        seq_lens,
-        spec=QWEN3_06B_METAL_SPEC,
-        scale=scale,
-    )
-
-
-@lru_cache(maxsize=1)
-def warmup_qwen3_radix_decode_deferred() -> None:
-    """Compile and execute a minimal deferred-attention graph at startup.
-
-    ``mx.fast.metal_kernel`` resolves its Metal pipeline lazily on the first
-    invocation.  Deferring that compilation until a live request would turn a
-    shader/toolchain error into a mid-serving failure.  A one-token, one-slot
-    graph is enough to validate the source, argument ABI, and threadgroup
-    configuration without allocating a production-sized KV cache.  Runtime
-    dimensions are template constants, but do not change the generated
-    instruction body or its resource contract.
-    """
-    import mlx.core as mx
-
-    spec = QWEN3_06B_METAL_SPEC
-    q = mx.zeros((1, spec.num_q_heads, spec.head_dim), dtype=mx.bfloat16)
-    current_k = mx.zeros((1, spec.num_kv_heads, spec.head_dim), dtype=mx.bfloat16)
-    current_v = mx.zeros_like(current_k)
-    k_pool = mx.zeros((1, spec.num_kv_heads, spec.head_dim), dtype=mx.bfloat16)
-    v_pool = mx.zeros_like(k_pool)
-    req_to_token = mx.zeros((1, 1), dtype=mx.int32)
-    req_pool_indices = mx.zeros((1,), dtype=mx.int64)
-    seq_lens = mx.ones((1,), dtype=mx.int64)
-    output = qwen3_radix_decode_deferred(
-        q,
-        current_k,
-        current_v,
-        k_pool,
-        v_pool,
-        req_to_token,
-        req_pool_indices,
-        seq_lens,
-    )
-    mx.eval(output)
-
-
 __all__ = [
     "DeferredAttentionSpec",
-    "qwen3_radix_decode_deferred",
     "radix_decode_deferred",
     "radix_prefill_deferred",
-    "warmup_qwen3_radix_decode_deferred",
 ]

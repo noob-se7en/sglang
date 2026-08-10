@@ -24,7 +24,7 @@ class TestQwen3MlxDeferredDecode(unittest.TestCase):
     def test_two_long_sequences_match_torch(self):
         import mlx.core as mx
 
-        from sglang.kernels.ops.attention._qwen3_mlx_metal import (
+        from sglang.kernels.ops.attention._deferred_radix_attention_mlx import (
             DeferredAttentionSpec,
             radix_decode_deferred,
         )
@@ -92,7 +92,7 @@ class TestQwen3MlxDeferredDecode(unittest.TestCase):
             )
 
     def test_generic_shape_matches_torch(self):
-        from sglang.kernels.ops.attention._qwen3_mlx_metal import (
+        from sglang.kernels.ops.attention._deferred_radix_attention_mlx import (
             DeferredAttentionSpec,
             radix_decode_deferred,
         )
@@ -184,7 +184,7 @@ class TestQwen3MlxDeferredDecode(unittest.TestCase):
     def test_packed_prefill_reads_radix_prefix_and_extension_rows(self):
         import mlx.core as mx
 
-        from sglang.kernels.ops.attention._qwen3_mlx_metal import (
+        from sglang.kernels.ops.attention._deferred_radix_attention_mlx import (
             DeferredAttentionSpec,
             radix_prefill_deferred,
         )
@@ -265,8 +265,9 @@ class TestQwen3MlxDeferredDecode(unittest.TestCase):
         )
 
     def test_current_token_bypasses_uncommitted_pool_entry(self):
-        from sglang.kernels.ops.attention._qwen3_mlx_metal import (
-            qwen3_radix_decode_deferred,
+        from sglang.kernels.ops.attention._deferred_radix_attention_mlx import (
+            DeferredAttentionSpec,
+            radix_decode_deferred,
         )
         from sglang.srt.utils.tensor_bridge import (
             borrow_torch_tensors,
@@ -314,7 +315,10 @@ class TestQwen3MlxDeferredDecode(unittest.TestCase):
             seq_lens,
             synchronize=False,
         )
-        result = qwen3_radix_decode_deferred(*(view.array for view in views))
+        result = radix_decode_deferred(
+            *(view.array for view in views),
+            spec=DeferredAttentionSpec(num_q_heads=16, num_kv_heads=8, head_dim=128),
+        )
         output = mlx_to_torch(result, device="mps")
 
         references = []

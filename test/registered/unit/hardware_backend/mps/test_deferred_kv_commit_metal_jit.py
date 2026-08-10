@@ -7,9 +7,8 @@ from unittest import mock
 import pytest
 import torch
 
-from sglang.kernels.ops.kvcache._qwen3_deferred_kv_commit_metal_jit import (
+from sglang.kernels.ops.kvcache._deferred_kv_commit_metal_jit import (
     commit_deferred_kv,
-    qwen3_commit_deferred_kv,
 )
 from sglang.test.ci.ci_register import register_mps_ci
 
@@ -38,7 +37,9 @@ def test_deferred_kv_commit_updates_prefill_rows_in_two_async_launches():
     with mock.patch.object(
         torch.mps, "synchronize", wraps=torch.mps.synchronize
     ) as synchronize:
-        qwen3_commit_deferred_kv(new_k, new_v, slots, k_pools, v_pools)
+        commit_deferred_kv(
+            new_k, new_v, slots, k_pools, v_pools, num_kv_heads=8, head_dim=128
+        )
     assert synchronize.call_count == 0
 
     torch.mps.synchronize()

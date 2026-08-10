@@ -1,6 +1,6 @@
 """Backend-neutral MLX attention primitives."""
 
-from sglang.kernels.ops.attention._qwen3_mlx_metal import (
+from sglang.kernels.ops.attention._deferred_radix_attention_mlx import (
     DeferredAttentionSpec,
     radix_decode_deferred,
     radix_prefill_deferred,
