@@ -48,7 +48,7 @@ class SRTPlatform(DeviceMixin):
         """
         pass
 
-    def bind_model_runtime_operators(
+    def configure_model_execution(
         self,
         *,
         model,
@@ -57,21 +57,13 @@ class SRTPlatform(DeviceMixin):
         req_to_token_pool,
         token_to_kv_pool,
     ) -> object | None:
-        """Bind platform model operators after the concrete pools exist.
-
-        The returned plan belongs to the runner and may expose lifecycle hooks
-        such as ``invalidate_views`` and ``close``. Platform singletons must not
-        retain model, pool, or provider state. The default is deliberately a
-        no-op so in-tree and out-of-tree platforms opt in independently.
-        """
+        """Configure platform execution after the concrete pools exist."""
         return None
 
     def supports_memory_pool_reallocation(self) -> bool:
         """Whether a live runner may replace its concrete KV pools.
 
-        Platforms whose operator plans borrow pool storage must return False
-        until they provide a transactional close, reallocation, and rebind
-        protocol. The generic Torch path remains reallocation-capable.
+        Platforms may return False when compiled execution borrows pool storage.
         """
         return True
 

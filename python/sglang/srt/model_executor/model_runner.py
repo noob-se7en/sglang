@@ -347,14 +347,6 @@ class ModelRunner:
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
-        # A platform may install model-specific semantic operators after the
-        # standard Torch model and KV pools exist.  The plan owns only custom
-        # operator state; ModelRunner remains authoritative for model, cache,
-        # scheduler, and request lifecycles.
-        self.platform_operator_plan = None
-        self._platform_forward_lock = None
-        self._platform_memory_pool_allocation_started = False
-
         self.init_startup_observability()
 
         self.init_remote_instance_weight_transporter()
@@ -680,12 +672,11 @@ class ModelRunner:
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
 
-    def _bind_platform_runtime_operators(self, model: torch.nn.Module):
-        """Bind platform providers against the allocated Torch KV pool."""
+    def _configure_platform_model_execution(self, model: torch.nn.Module) -> None:
         if str(self.device).split(":", 1)[0] != current_platform.device_type:
-            return None
+            return
 
-        return current_platform.bind_model_runtime_operators(
+        current_platform.configure_model_execution(
             model=model,
             model_config=self.model_config,
             server_args=self.server_args,
@@ -833,19 +824,6 @@ class ModelRunner:
 
     def alloc_memory_pool(self, memory_pool_config: Optional[MemoryPoolConfig] = None):
         """Allocate KV cache memory pools only (no backends or cuda graphs)."""
-        runner_device_type = str(self.device).split(":", 1)[0]
-        if (
-            runner_device_type == current_platform.device_type
-            and not current_platform.supports_memory_pool_reallocation()
-        ):
-            if getattr(self, "_platform_memory_pool_allocation_started", False):
-                raise RuntimeError(
-                    f"{current_platform.device_type} memory-pool allocation is "
-                    "one-shot because platform operators borrow the pool storage; "
-                    "construct a new ModelRunner instead of replacing a live pool"
-                )
-            self._platform_memory_pool_allocation_started = True
-
         if memory_pool_config is not None:
             self.memory_pool_config = memory_pool_config
 
@@ -865,14 +843,7 @@ class ModelRunner:
         # Keep a reference so the shared byte buffer is not GC'd.
         self._unified_memory_pool = result.unified_memory_pool
 
-        # The model and concrete KV storage now both exist.  Validate NHD,
-        # dtype, shape, pointer identity, and every layer before publishing a
-        # provider.  This turns unsupported HND/page-major pools into a startup
-        # fallback/error instead of a first-request memory-layout failure.
-        self.platform_operator_plan = self._bind_platform_runtime_operators(self.model)
-        self._platform_forward_lock = getattr(
-            self.platform_operator_plan, "forward_lock", None
-        )
+        self._configure_platform_model_execution(self.model)
 
         self._init_post_memory_pool_components()
 
@@ -1489,22 +1460,6 @@ class ModelRunner:
         reinit_attn_backend: bool = False,
         forward_count: int = 1,
     ) -> LogitsProcessorOutput:
-        lock = getattr(self, "_platform_forward_lock", None)
-        if lock is None:
-            return self._forward_split_prefill_unlocked(
-                forward_batch, reinit_attn_backend, forward_count
-            )
-        with lock:
-            return self._forward_split_prefill_unlocked(
-                forward_batch, reinit_attn_backend, forward_count
-            )
-
-    def _forward_split_prefill_unlocked(
-        self,
-        forward_batch: ForwardBatch,
-        reinit_attn_backend: bool = False,
-        forward_count: int = 1,
-    ) -> LogitsProcessorOutput:
         if forward_batch.split_index == 0 or reinit_attn_backend:
             self.attn_backend.init_forward_metadata(forward_batch)
         next_split_index = min(
@@ -1666,30 +1621,6 @@ class ModelRunner:
         forward_batch.mamba_cow_dst_indices = None
 
     def _forward_raw(
-        self,
-        forward_batch: ForwardBatch,
-        pp_proxy_tensors: Optional[PPProxyTensors],
-        reinit_attn_backend: bool = False,
-        split_forward_count: int = 1,
-    ) -> ModelRunnerOutput:
-        """Run one model forward under its platform operator lock, if any."""
-        lock = getattr(self, "_platform_forward_lock", None)
-        if lock is None:
-            return self._forward_raw_unlocked(
-                forward_batch,
-                pp_proxy_tensors,
-                reinit_attn_backend,
-                split_forward_count,
-            )
-        with lock:
-            return self._forward_raw_unlocked(
-                forward_batch,
-                pp_proxy_tensors,
-                reinit_attn_backend,
-                split_forward_count,
-            )
-
-    def _forward_raw_unlocked(
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors],
@@ -2162,117 +2093,11 @@ class ModelRunner:
         load_format: str,
         load_config: LoadConfig,
     ) -> None:
-        """Publish a replacement Torch model and its platform operator plan.
-
-        Online loaders usually mutate the existing module; in that case the
-        WeightUpdater invalidates borrowed custom-op views after the mutation.
-        A loader that returns a new module receives a fully prepared platform
-        plan before the serving model is switched.
-        """
-        lock = getattr(self, "_platform_forward_lock", None)
-        lock_ctx = lock if lock is not None else contextlib.nullcontext()
-        with lock_ctx:
-            model_replaced = new_model is not self.model
-            old_plan = getattr(self, "platform_operator_plan", None)
-            resolved_args = get_context().resolved_server_args_dict()
-            old_model_path = resolved_args.get("model_path")
-            old_load_format = resolved_args.get("load_format")
-
-            if not model_replaced:
-                if not self.is_draft_worker:
-                    get_context().override(
-                        "model_runner.update_model_fields",
-                        model_path=model_path,
-                        load_format=load_format,
-                    )
-                self.model = new_model
-                self.load_config = load_config
-                return
-
-            # Validate the generic config publication while the old optimized
-            # plan is still intact. Then retire it before compiling the new
-            # provider so a 16 GB unified-memory machine never retains two MLX
-            # executable/borrow sets during an online replacement.
-            if not self.is_draft_worker:
-                get_context().override(
-                    "model_runner.update_model_fields",
-                    model_path=model_path,
-                    load_format=load_format,
-                )
-            close_old_plan = getattr(old_plan, "close", None)
-            try:
-                if callable(close_old_plan):
-                    close_old_plan()
-                self.platform_operator_plan = None
-                new_plan = self._bind_platform_runtime_operators(new_model)
-                new_lock = getattr(new_plan, "forward_lock", None)
-                if lock is not None and new_lock is not lock:
-                    close_new_plan = getattr(new_plan, "close", None)
-                    if callable(close_new_plan):
-                        close_new_plan()
-                    raise RuntimeError(
-                        "a replacement platform operator plan changed the "
-                        "runner's serving lock identity"
-                    )
-            except Exception:
-                if not self.is_draft_worker:
-                    try:
-                        get_context().override(
-                            "model_runner.update_model_fields.rollback",
-                            model_path=old_model_path,
-                            load_format=old_load_format,
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Failed to roll back server arguments after a model "
-                            "replacement failed"
-                        )
-                # The old model remains published with its optimized hooks
-                # cleared by old_plan.close(), so it stays correct through the
-                # ordinary Torch path even though the replacement failed.
-                raise
-
-            # All fallible preparation is complete. Publish the Torch model and
-            # the custom-op plan together while forward/update serialization is
-            # still held.
-            self.model = new_model
-            self.load_config = load_config
-            self.platform_operator_plan = new_plan
-            self._platform_forward_lock = new_lock
-
-    def invalidate_platform_operator_views(self) -> None:
-        """Drop borrowed custom-op views after a Torch weight mutation."""
-        plan = getattr(self, "platform_operator_plan", None)
-        invalidate = getattr(plan, "invalidate_views", None)
-        if not callable(invalidate):
-            return
-        lock = getattr(self, "_platform_forward_lock", None)
-        lock_ctx = lock if lock is not None else contextlib.nullcontext()
-        with lock_ctx:
-            invalidate()
-
-    def close_platform_operators(self) -> None:
-        """Release platform custom-op state before model/cache teardown."""
-        plan = getattr(self, "platform_operator_plan", None)
-        close = getattr(plan, "close", None)
-        if not callable(close):
-            return
-        lock = getattr(self, "_platform_forward_lock", None)
-        lock_ctx = lock if lock is not None else contextlib.nullcontext()
-        with lock_ctx:
-            close()
-
-    def get_platform_operator_state(self) -> Optional[dict]:
-        """Return the automatically selected platform operator implementations."""
-        plan = getattr(self, "platform_operator_plan", None)
-        if plan is None:
-            return None
-        get_state = getattr(plan, "get_state", None)
-        if callable(get_state):
-            return get_state()
-        return {
-            "enabled": bool(getattr(plan, "enabled", False)),
-            "model": getattr(plan, "model", None),
-            "attention_backend": getattr(plan, "attention_backend", "torch"),
-            "fallback_reason": getattr(plan, "fallback_reason", None),
-        }
+        self.model = new_model
+        if not self.is_draft_worker:
+            get_context().override(
+                "model_runner.update_model_fields",
+                model_path=model_path,
+                load_format=load_format,
+            )
+        self.load_config = load_config

@@ -131,28 +131,21 @@ assert not any(name == "mlx" or name.startswith("mlx.") for name in sys.modules)
         with self.assertRaisesRegex(ValueError, "detected quantization='awq'"):
             ServerArgs._validate_mps_resolved_model_config(args)
 
-    def test_platform_rejects_effective_quantization_before_installer(self):
+    def test_platform_rejects_effective_quantization_before_capture(self):
         from sglang.srt.platforms.mps import MpsSRTPlatform
 
         model_config = types.SimpleNamespace(
             quantization="awq",
             is_multimodal=False,
         )
-        with (
-            mock.patch(
-                "sglang.srt.hardware_backend.mps.model_ops.router.install_mps_operators"
-            ) as install,
-            self.assertRaisesRegex(ValueError, "detected quantization='awq'"),
-        ):
-            MpsSRTPlatform().bind_model_runtime_operators(
+        with self.assertRaisesRegex(ValueError, "detected quantization='awq'"):
+            MpsSRTPlatform().configure_model_execution(
                 model=object(),
                 model_config=model_config,
                 server_args=types.SimpleNamespace(enable_lora=False),
                 req_to_token_pool=object(),
                 token_to_kv_pool=object(),
             )
-        install.assert_not_called()
-
     def test_unvalidated_runtime_pairs_are_rejected(self):
         cases = (
             ("2.12.1", "0.32.0", "tested stable Torch 2.13.x"),

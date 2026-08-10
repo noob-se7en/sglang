@@ -211,10 +211,10 @@ class TestSRTPlatform(CustomTestCase):
         self.assertFalse(base.is_pin_memory_available())
         self.assertFalse(base.is_pin_memory_available(device="cpu"))
 
-    def test_base_runtime_operator_hook_is_a_noop(self):
+    def test_base_model_execution_hook_is_a_noop(self):
         base = SRTPlatform()
         self.assertIsNone(
-            base.bind_model_runtime_operators(
+            base.configure_model_execution(
                 model=object(),
                 model_config=object(),
                 server_args=object(),
@@ -423,7 +423,7 @@ class TestMpsDeviceMixin(CustomTestCase):
         self.assertEqual(base.get_default_attention_backend(), "mps")
         self.assertEqual(base.get_torch_distributed_backend_str(), "gloo")
         self.assertFalse(base.is_pin_memory_available())
-        self.assertFalse(base.supports_memory_pool_reallocation())
+        self.assertTrue(base.supports_memory_pool_reallocation())
 
     def test_single_device_contract(self):
         base = MpsSRTPlatform()
@@ -477,37 +477,6 @@ class TestMpsDeviceMixin(CustomTestCase):
         self.assertEqual(base.get_device_count(), 1)
         self.assertEqual(base.get_device_core_count(), 0)
         self.assertIsNone(base.get_device_capability())
-
-    @patch("sglang.srt.hardware_backend.mps.model_ops.router.install_mps_operators")
-    def test_runtime_operator_hook_binds_automatic_plan_after_pool_allocation(
-        self, mock_install
-    ):
-        base = MpsSRTPlatform()
-        model = object()
-        model_config = object()
-        server_args = object()
-        req_pool = object()
-        pool = object()
-        report = object()
-        mock_install.return_value = report
-
-        self.assertIs(
-            base.bind_model_runtime_operators(
-                model=model,
-                model_config=model_config,
-                server_args=server_args,
-                req_to_token_pool=req_pool,
-                token_to_kv_pool=pool,
-            ),
-            report,
-        )
-        mock_install.assert_called_once_with(
-            model=model,
-            model_config=model_config,
-            server_args=server_args,
-            req_to_token_pool=req_pool,
-            token_to_kv_pool=pool,
-        )
 
     def test_common_device_helpers_route_to_mps_platform(self):
         from sglang.srt.utils import common

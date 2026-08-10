@@ -1,1 +1,1 @@
-"""Apple MPS SRT providers."""
+"""Apple MPS support for the Torch-owned SRT runtime."""

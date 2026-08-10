@@ -113,20 +113,6 @@ def _ensure_model_layers(model_runner: Any) -> None:
     ) = compute_attention_and_moe_layers(layer_model)
 
 
-@contextlib.contextmanager
-def _without_model_op_providers(model: torch.nn.Module):
-    saved = []
-    for module in model.modules():
-        if hasattr(module, "op_provider"):
-            saved.append((module, module.op_provider))
-            module.op_provider = None
-    try:
-        yield
-    finally:
-        for module, provider in saved:
-            module.op_provider = provider
-
-
 def _prepare_prefill_batch(
     model_runner: Any, input_ids: list[np.ndarray]
 ) -> tuple[ScheduleBatch, ForwardBatch]:
@@ -358,7 +344,6 @@ def _run_generation_parity(
         with (
             forward_context(ForwardContext(attn_backend=model_runner.attn_backend)),
             _ensure_export_context(model_runner, forward_batch),
-            _without_model_op_providers(model_runner.model),
         ):
             current_wrapper, torch_args = build_serving_forward_wrapper(
                 model_runner, forward_batch
@@ -568,7 +553,6 @@ def _benchmark_bucket(
         with (
             forward_context(ForwardContext(attn_backend=model_runner.attn_backend)),
             _ensure_export_context(model_runner, forward_batch),
-            _without_model_op_providers(model_runner.model),
         ):
             torch_wrapper, torch_args = build_serving_forward_wrapper(
                 model_runner, forward_batch

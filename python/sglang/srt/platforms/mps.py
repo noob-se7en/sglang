@@ -135,12 +135,7 @@ class MpsSRTPlatform(MpsDeviceMixin, SRTPlatform):
 
         validate_mps_runtime()
 
-    def supports_memory_pool_reallocation(self) -> bool:
-        # Selected MLX/Metal providers borrow the concrete Torch KV storage.
-        # Replacing a live pool needs an explicit close/rebind transaction.
-        return False
-
-    def bind_model_runtime_operators(
+    def configure_model_execution(
         self,
         *,
         model,
@@ -149,13 +144,6 @@ class MpsSRTPlatform(MpsDeviceMixin, SRTPlatform):
         req_to_token_pool,
         token_to_kv_pool,
     ) -> object | None:
-        # Import lazily: a plain CPU/CUDA/NPU process must not load Apple
-        # operator implementations merely because it imports the platform
-        # layer.  MPS has one execution backend; this plan automatically
-        # selects MLX/Metal/Torch implementations per semantic operation.
-        from sglang.srt.hardware_backend.mps.model_ops.router import (
-            install_mps_operators,
-        )
         from sglang.srt.hardware_backend.mps.runtime import (
             validate_mps_model_config,
         )
@@ -182,24 +170,13 @@ class MpsSRTPlatform(MpsDeviceMixin, SRTPlatform):
             )
             return None
 
-        if os.environ.get("SGLANG_MLX_EXPORT_VALIDATE"):
-            return None
-
-        report = install_mps_operators(
-            model=model,
-            model_config=model_config,
-            server_args=server_args,
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool=token_to_kv_pool,
-        )
-        return report
+        return None
 
     def get_default_attention_backend(self) -> str:
         return "mps"
 
     def get_compile_backend(self, mode: str | None = None) -> str:
-        # Torch MPS has no SGLang compiler backend. MLX compilation is owned by
-        # the selected semantic operator, not by a second model/graph runner.
+        # Whole-region MLX lowering is installed explicitly during capture.
         return "eager"
 
     def get_dispatch_key_name(self) -> str:

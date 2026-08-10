@@ -1603,15 +1603,6 @@ class Scheduler(
     def release_host_resources(self) -> None:
         # Release pinned host buffers in userspace on graceful shutdown; see
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
-        # A platform plan may own compiled kernels and borrowed model/cache
-        # views. Fence and release those before tearing down their Torch owners.
-        for worker in (
-            getattr(self, "tp_worker", None),
-            getattr(self, "draft_worker", None),
-        ):
-            close_platform_operators = getattr(worker, "close_platform_operators", None)
-            if callable(close_platform_operators):
-                close_platform_operators()
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
         self.tree_cache.release_host_resources()
@@ -4228,10 +4219,6 @@ class Scheduler(
         )
         ret["startup_time"] = self.startup_time
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
-
-        platform_operator_state = self.tp_worker.get_platform_operator_state()
-        if platform_operator_state is not None:
-            ret[f"{current_platform.device_type}_operator"] = platform_operator_state
 
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager

@@ -123,7 +123,7 @@ jobs:
         run: |
           uv run python -c "import mlx.core as mx, torch; from sgl_kernel.metal import is_metal_aot_available, warmup_qwen3_06b_metal_aot; assert torch.backends.mps.is_available(), 'PyTorch MPS is unavailable'; assert mx.metal.is_available(), 'MLX Metal is unavailable'; assert callable(getattr(torch.mps, 'compile_shader', None)), 'torch.mps.compile_shader is unavailable'; assert callable(getattr(torch.mps, 'load_metallib', None)), 'torch.mps.load_metallib is unavailable'; assert is_metal_aot_available(), 'packaged Metal AOT library is unavailable'; warmup_qwen3_06b_metal_aot(); print('torch', torch.__version__, 'mlx', mx.__version__, 'MPS/Metal JIT+AOT: available')"
 
-      - name: Run model-free MPS semantic-operator unit tests
+      - name: Run model-free MPS kernel unit tests
         timeout-minutes: 15
         run: |
           uv run python test/run_suite.py --hw mps --suite stage-a-unit-test-mps

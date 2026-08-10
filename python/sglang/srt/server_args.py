@@ -4309,8 +4309,8 @@ class ServerArgs:
         if bool(getattr(self, "enable_torch_compile", False)):
             raise ValueError(
                 "Torch MPS does not yet provide an SGLang torch.compile graph "
-                "runner; disable --enable-torch-compile. MLX compilation is "
-                "selected independently inside eligible MPS semantic operators."
+                "runner; disable --enable-torch-compile. Whole-region MLX "
+                "lowering currently uses its dedicated validation path."
             )
 
         quantization = getattr(self, "quantization", None)

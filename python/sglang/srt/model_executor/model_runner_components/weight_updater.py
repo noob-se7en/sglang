@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import gc
 import logging
-from contextlib import contextmanager
 from dataclasses import dataclass, field
-from functools import wraps
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import torch
@@ -34,44 +32,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _serialize_runtime_operator_weight_update(method):
-    """Serialize parameter mutation with a platform custom-op forward lock.
-
-    A custom operator may borrow a live Parameter allocation. Taking the lock
-    only while invalidating its views is too late: a concurrent forward could
-    observe a partially loaded parameter. Ordinary runners pay only a
-    null-context lookup.
-    """
-
-    @wraps(method)
-    def wrapped(self, *args, **kwargs):
-        with self._runtime_operator_weight_update_guard():
-            return method(self, *args, **kwargs)
-
-    return wrapped
-
-
 def _get_weight_update_device(device: str):
-    """Resolve the destination used for serialized weight tensors.
-
-    CUDA-like modules expose ``current_device``; CPU and MPS intentionally do
-    not.  Returning a concrete ``torch.device`` for the latter keeps tensor
-    updates backend-neutral without changing CUDA/MUSA/XPU behavior.
-    """
+    """Resolve devices that do not expose a CUDA-style current_device API."""
     device_module = torch.get_device_module(device)
     current_device = getattr(device_module, "current_device", None)
     return current_device() if callable(current_device) else torch.device(device)
-
-
-def _unsupported_distributed_weight_update_error(device: str) -> Optional[str]:
-    """Return an actionable error for collectives that cannot carry MPS tensors."""
-    if str(device).split(":", 1)[0].lower() != "mps":
-        return None
-    return (
-        "Distributed online weight updates are not supported on MPS: "
-        "PyTorch 2.13 torch.distributed collectives cannot broadcast MPS tensors. "
-        "Use update_weights_from_disk or update_weights_from_tensor instead."
-    )
 
 
 def _unsupported_derived_weight_cache_error() -> Optional[str]:
@@ -106,28 +71,6 @@ class WeightUpdater:
     get_model_runner: Callable[[], ModelRunner]
     _model_update_group: dict = field(default_factory=dict)
 
-    def _invalidate_runtime_operator_views(self) -> None:
-        """Invalidate borrowed platform-operator views after mutation.
-
-        The callback is deliberately discovered on the runner at runtime so
-        the weight-update component remains backend-agnostic and does not
-        import a platform implementation on ordinary Torch/CUDA paths.
-        """
-        runner = self.get_model_runner()
-        invalidate = getattr(runner, "invalidate_platform_operator_views", None)
-        if invalidate is not None:
-            invalidate()
-
-    @contextmanager
-    def _runtime_operator_weight_update_guard(self):
-        runner = self.get_model_runner()
-        lock = getattr(runner, "_platform_forward_lock", None)
-        if lock is None:
-            yield
-        else:
-            with lock:
-                yield
-
     def init_weights_update_group(
         self,
         master_address,
@@ -147,10 +90,6 @@ class WeightUpdater:
         weights/parameters online, and broadcasts them to the inference
         engine through the `_model_update_group` process group.
         """
-        error = _unsupported_distributed_weight_update_error(self.device)
-        if error is not None:
-            return False, error
-
         assert (
             torch.distributed.is_initialized()
         ), "Default torch process group must be initialized"
@@ -206,7 +145,6 @@ class WeightUpdater:
                 f"Restart with --weight-cache-mode off to use this operation."
             )
 
-    @_serialize_runtime_operator_weight_update
     def update_weights_from_disk(
         self: WeightUpdater,
         model_path: str,
@@ -264,24 +202,16 @@ class WeightUpdater:
                 )
                 del iter
                 gc.collect()
-                try:
-                    iter = get_weight_iter(self.model_config)
-                    model_load_weights(self.get_model(), iter)
-                finally:
-                    # The failed load may have changed a subset of Parameters;
-                    # invalidate even when rollback itself raises.
-                    self._invalidate_runtime_operator_views()
+                iter = get_weight_iter(self.model_config)
+                model_load_weights(self.get_model(), iter)
                 return False, message
 
-        try:
-            self.update_model_fields(
-                model,
-                model_path=model_path,
-                load_format=load_format,
-                load_config=load_config,
-            )
-        finally:
-            self._invalidate_runtime_operator_views()
+        self.update_model_fields(
+            model,
+            model_path=model_path,
+            load_format=load_format,
+            load_config=load_config,
+        )
 
         if recapture_cuda_graph and (
             self.device == "cuda"
@@ -296,7 +226,6 @@ class WeightUpdater:
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
 
-    @_serialize_runtime_operator_weight_update
     def update_weights_from_distributed(
         self: WeightUpdater,
         names,
@@ -315,9 +244,6 @@ class WeightUpdater:
             shape: the shape of the parameter to be updated.
         """
         self._assert_weight_cache_inactive("update_weights_from_distributed")
-        error = _unsupported_distributed_weight_update_error(self.device)
-        if error is not None:
-            return False, error
         error = _unsupported_derived_weight_cache_error()
         if error is not None:
             return False, error
@@ -352,11 +278,9 @@ class WeightUpdater:
                 handle.wait()
 
             self.get_model().load_weights(weights)
-            self._invalidate_runtime_operator_views()
             return True, "Succeeded to update parameter online."
 
         except Exception as e:
-            self._invalidate_runtime_operator_views()
             error_msg = (
                 f"Failed to update parameter online: {e}. "
                 f"The full weights of the ModelRunner are partially updated. "
@@ -365,7 +289,6 @@ class WeightUpdater:
             logger.error(error_msg)
             return False, error_msg
 
-    @_serialize_runtime_operator_weight_update
     def _update_bucketed_weights_from_distributed(
         self: WeightUpdater, names, dtypes, shapes, group_name
     ):
@@ -390,10 +313,8 @@ class WeightUpdater:
             )
             reconstructed_tensors = bucket.reconstruct_tensors()
             self.get_model().load_weights(reconstructed_tensors)
-            self._invalidate_runtime_operator_views()
-            return True, "Succeeded to update parameter online."
+            return True, f"Succeeded to update parameter online."
         except Exception as e:
-            self._invalidate_runtime_operator_views()
             error_msg = (
                 f"Failed to update parameter online: {e}. "
                 f"The full weights of the ModelRunner are partially updated. "
@@ -402,7 +323,6 @@ class WeightUpdater:
             logger.error(error_msg)
             return False, error_msg
 
-    @_serialize_runtime_operator_weight_update
     def update_weights_from_tensor(
         self: WeightUpdater,
         named_tensors: List[Tuple[str, Union[torch.Tensor, LocalSerializedTensor]]],
@@ -421,30 +341,23 @@ class WeightUpdater:
             )
 
         # We need to get device after patch otherwise the device would be wrong
-        # CUDA-like backends expose a process-local integer device index.  MPS
-        # (and CPU) do not, so resolve them to an explicit torch.device.
         inferred_device = _get_weight_update_device(self.device)
 
         named_tensors = [
             (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=inferred_device))
             for name, tensor in named_tensors
         ]
-        try:
-            if load_format == "direct":
-                _model_load_weights_direct(self.get_model(), named_tensors)
-            elif load_format in self.custom_weight_loaders:
-                custom_loader = dynamic_import(load_format)
-                custom_loader(self.get_model(), named_tensors)
-            elif load_format is None:
-                self.get_model().load_weights(named_tensors)
-            else:
-                raise NotImplementedError(f"Unknown load_format={load_format}")
-        finally:
-            # A loader can fail after mutating only part of the model.
-            self._invalidate_runtime_operator_views()
+        if load_format == "direct":
+            _model_load_weights_direct(self.get_model(), named_tensors)
+        elif load_format in self.custom_weight_loaders:
+            custom_loader = dynamic_import(load_format)
+            custom_loader(self.get_model(), named_tensors)
+        elif load_format is None:
+            self.get_model().load_weights(named_tensors)
+        else:
+            raise NotImplementedError(f"Unknown load_format={load_format}")
         return True, "Success"
 
-    @_serialize_runtime_operator_weight_update
     def _update_weights_from_flattened_bucket(
         self: WeightUpdater,
         flattened_tensor_bucket_dict,
@@ -472,28 +385,17 @@ class WeightUpdater:
         )
         reconstructed_tensors = bucket.reconstruct_tensors()
 
-        # Load the reconstructed tensors using the standard method.
-        try:
-            self.get_model().load_weights(reconstructed_tensors)
-        finally:
-            self._invalidate_runtime_operator_views()
+        # Load the reconstructed tensors using the standard method
+        self.get_model().load_weights(reconstructed_tensors)
 
         return True, "Success"
 
-    @_serialize_runtime_operator_weight_update
     def update_weights_from_ipc(self: WeightUpdater, recv_req):
         """Update weights from IPC for checkpoint-engine integration."""
         self._assert_weight_cache_inactive("update_weights_from_ipc")
         error = _unsupported_derived_weight_cache_error()
         if error is not None:
             return False, error
-        device_type = str(self.device).split(":", 1)[0].lower()
-        if device_type != "cuda":
-            return (
-                False,
-                "IPC weight updates through checkpoint-engine require a "
-                f"CUDA-compatible device; got device={self.device!r}",
-            )
 
         try:
             from sglang.srt.checkpoint_engine.checkpoint_engine_worker import (
@@ -503,13 +405,10 @@ class WeightUpdater:
             # Create a worker extension that integrates with SGLang's model
             worker = SGLangCheckpointEngineWorkerExtensionImpl(self.get_model_runner())
             worker.update_weights_from_ipc(recv_req.zmq_handles)
-            self._invalidate_runtime_operator_views()
             return True, "IPC weight update completed successfully"
         except ImportError as e:
-            self._invalidate_runtime_operator_views()
             return False, f"IPC weight update failed: ImportError {e}"
         except Exception as e:
-            self._invalidate_runtime_operator_views()
             logger.error(f"IPC weight update failed: {e}")
             return False, str(e)
 

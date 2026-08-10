@@ -883,22 +883,6 @@ class Envs:
     # reference implementations for numerical-bug bisection.
     SGLANG_FORCE_FUSED_OP_BACKEND = EnvStr(None)
 
-    # Apple MPS semantic-operator providers.  The Torch ModelRunner remains
-    # the only model/storage owner; each list is ordered best -> fallback,
-    # must end in ``torch``, and is resolved once when the MPS model-op plan is
-    # installed.  Keep Torch as the default so enabling MPS never implicitly
-    # opts a process into an experimental provider.  A provider can be enabled independently, e.g.
-    # ``metal_aot,metal_jit,torch`` for Qwen3 QK-norm/RoPE/KV-store while
-    # leaving Radix decode on ``torch``.
-    SGLANG_MPS_QWEN3_MODEL_FORWARD = EnvTuple(("torch",))
-    SGLANG_MPS_QWEN3_GREEDY_TAIL = EnvTuple(("torch",))
-    SGLANG_MPS_QWEN3_QKNORM_ROPE_STORE = EnvTuple(("torch",))
-    SGLANG_MPS_QWEN3_RADIX_DECODE = EnvTuple(("torch",))
-    SGLANG_MPS_QWEN3_DEFERRED_KV_COMMIT = EnvTuple(("torch",))
-    SGLANG_MPS_RMSNORM = EnvTuple(("torch",))
-    SGLANG_MPS_FUSED_ADD_RMSNORM = EnvTuple(("torch",))
-    SGLANG_MPS_SILU_AND_MUL = EnvTuple(("torch",))
-
     USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)
     SGLANG_RETURN_ORIGINAL_LOGPROB = EnvBool(False)
     SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN = EnvBool(False)
