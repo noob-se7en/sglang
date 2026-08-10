@@ -214,6 +214,64 @@ def commit_deferred_kv(
         )
 
 
+def verify_deferred_kv_commit(
+    k_pools: list[torch.Tensor] | tuple[torch.Tensor, ...],
+    v_pools: list[torch.Tensor] | tuple[torch.Tensor, ...],
+    *,
+    num_kv_heads: int,
+    head_dim: int,
+) -> None:
+    """Fail fast if the Metal-JIT commit path is silently dropping writes.
+
+    Under high unified-memory pressure the ``torch.mps.compile_shader``
+    dispatch path can lose its writes without raising (observed on
+    torch 2.13 near the Metal working-set limit, while plain torch ops on
+    the same buffers still land).  Serving on a pool whose commits vanish
+    corrupts every request, so probe the real pool buffers once by
+    committing a sentinel through the same kernel into the reserved
+    padding slot 0 and reading it back.
+    """
+    num_layers = len(k_pools)
+    if num_layers == 0:
+        return
+    device = k_pools[0].device
+    sentinel_k = torch.full(
+        (num_layers, 1, num_kv_heads, head_dim), 3.0, dtype=torch.bfloat16, device=device
+    )
+    sentinel_v = torch.full_like(sentinel_k, -5.0)
+    slot0 = torch.zeros((1,), dtype=torch.int64, device=device)
+    saved = [
+        (k_pools[i][0].clone(), v_pools[i][0].clone()) for i in range(num_layers)
+    ]
+    try:
+        commit_deferred_kv(
+            sentinel_k,
+            sentinel_v,
+            slot0,
+            k_pools,
+            v_pools,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+        )
+        torch.mps.synchronize()
+        for layer_id in range(num_layers):
+            k_ok = bool((k_pools[layer_id][0] == 3.0).all())
+            v_ok = bool((v_pools[layer_id][0] == -5.0).all())
+            if not (k_ok and v_ok):
+                raise RuntimeError(
+                    "deferred KV commit verification failed at layer "
+                    f"{layer_id}: the Metal-JIT commit kernel is silently "
+                    "dropping writes (known failure mode near the Metal "
+                    "working-set limit). Reduce the KV pool size "
+                    "(e.g. --max-total-tokens) or free memory and relaunch."
+                )
+    finally:
+        for layer_id, (saved_k, saved_v) in enumerate(saved):
+            k_pools[layer_id][0] = saved_k
+            v_pools[layer_id][0] = saved_v
+        torch.mps.synchronize()
+
+
 def qwen3_commit_deferred_kv(
     new_k: torch.Tensor,
     new_v: torch.Tensor,
@@ -236,5 +294,6 @@ def qwen3_commit_deferred_kv(
 __all__ = [
     "commit_deferred_kv",
     "qwen3_commit_deferred_kv",
+    "verify_deferred_kv_commit",
     "warmup_qwen3_kv_commit",
 ]

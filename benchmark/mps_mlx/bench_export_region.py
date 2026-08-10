@@ -244,6 +244,7 @@ def _kv_state_metrics(torch_state, mlx_state) -> dict[str, float]:
             "cosine_similarity": 1.0,
         }
     device = torch_state[0][0].device
+    reference_abs_max = torch.zeros((), device=device)
     max_error = torch.zeros((), device=device)
     absolute_error_sum = torch.zeros((), device=device)
     squared_error_sum = torch.zeros((), device=device)
@@ -256,6 +257,9 @@ def _kv_state_metrics(torch_state, mlx_state) -> dict[str, float]:
             (torch_layer[3].float(), mlx_layer[3].float()),
             (torch_layer[4].float(), mlx_layer[4].float()),
         ):
+            reference_abs_max = torch.maximum(
+                reference_abs_max, reference.abs().max()
+            )
             error = candidate - reference
             max_error = torch.maximum(max_error, error.abs().max())
             absolute_error_sum += error.abs().sum()
@@ -275,6 +279,10 @@ def _kv_state_metrics(torch_state, mlx_state) -> dict[str, float]:
         "mean_abs_error": float((absolute_error_sum / element_count).cpu()),
         "relative_l2_error": float(relative_l2.cpu()),
         "cosine_similarity": float(cosine.cpu()),
+        # A zero reference means the Torch forward never wrote the pool rows;
+        # matching it proves nothing (both engines silently losing writes
+        # reads as a perfect match otherwise).
+        "reference_abs_max": float(reference_abs_max.cpu()),
     }
 
 
@@ -620,6 +628,7 @@ def _benchmark_bucket(
                 and direct_kv_metrics["cosine_similarity"] >= _MIN_KV_COSINE
                 and direct_kv_metrics["mean_abs_error"]
                 <= _MAX_KV_MEAN_ABS_ERROR
+                and direct_kv_metrics["reference_abs_max"] > 0.0
                 and direct_commit_error == 0.0
             )
             full_difference = (mlx_logits.float() - torch_logits.float()).abs()

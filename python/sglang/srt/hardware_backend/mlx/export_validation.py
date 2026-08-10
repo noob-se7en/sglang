@@ -134,7 +134,7 @@ def build_serving_mlx_executor(
             num_tokens=batch.input_ids.shape[0],
         )
         wrapper, args = build_serving_forward_wrapper(model_runner, batch)
-        exported = torch.export.export(wrapper, args, strict=True)
+        exported = torch.export.export(wrapper, args, strict=False)
         if batch.forward_mode.is_decode():
             execution_mode = "decode"
             executor = make_mlx_decode_export_executor(exported, args)
@@ -174,7 +174,7 @@ def export_serving_forward(
         num_tokens=forward_batch.input_ids.shape[0],
     )
     wrapper, args = build_serving_forward_wrapper(model_runner, forward_batch)
-    exported = torch.export.export(wrapper, args, strict=True)
+    exported = torch.export.export(wrapper, args, strict=False)
     graph = exported.graph_module.graph
     attention_nodes = [
         node

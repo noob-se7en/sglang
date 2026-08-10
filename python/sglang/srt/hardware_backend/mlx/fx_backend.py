@@ -483,7 +483,10 @@ def _make_mlx_export_executor(
     import mlx.core as mx
     import os
 
-    from sglang.kernels.ops.attention.mlx_kv_commit import commit_deferred_kv
+    from sglang.kernels.ops.attention.mlx_kv_commit import (
+        commit_deferred_kv,
+        verify_deferred_kv_commit,
+    )
     from sglang.kernels.ops.attention.mlx_radix_attention import (
         DeferredAttentionSpec,
         radix_decode_deferred,
@@ -548,6 +551,16 @@ def _make_mlx_export_executor(
         _get_graph_tensor(graph_module, node.kwargs["v_cache"])
         for node in attention_nodes
     )
+    if k_pools:
+        # Loud launch-time failure beats silently serving a pool whose
+        # commits vanish (compile_shader write loss near the working-set
+        # limit); probes the real buffers through the same kernel.
+        verify_deferred_kv_commit(
+            list(k_pools),
+            list(v_pools),
+            num_kv_heads=int(k_pools[0].shape[1]),
+            head_dim=int(k_pools[0].shape[2]),
+        )
     out_cache_position = 4
     debug_attention = bool(os.environ.get("SGLANG_MLX_EXPORT_DEBUG_ATTENTION"))
 
@@ -666,8 +679,11 @@ def _make_mlx_export_executor(
         else:
             logits, new_k, new_v = results
         if os.environ.get("SGLANG_MLX_EXPORT_DEBUG_KV_DELTAS"):
-            execute.last_new_k = new_k
-            execute.last_new_v = new_v
+            # new_k/new_v are zero-copy views of MLX-owned buffers; MLX may
+            # reuse those buffers on the next region run, so a stash held
+            # across runs must own its storage.
+            execute.last_new_k = new_k.clone()
+            execute.last_new_v = new_v.clone()
         first_k_pool = k_pools[0]
         spec = DeferredAttentionSpec(
             num_q_heads=(
@@ -722,7 +738,21 @@ def _get_graph_tensor(
     try:
         return graph_module.get_parameter(target)
     except AttributeError:
+        pass
+    try:
         return graph_module.get_buffer(target)
+    except AttributeError:
+        pass
+    # Non-strict export stores lifted closure constants (`lifted_tensor_*`)
+    # as plain module attributes, reachable only by attribute traversal.
+    value = graph_module
+    for part in target.split("."):
+        value = getattr(value, part)
+    if not isinstance(value, torch.Tensor):
+        raise UnsupportedMlxFxGraphError(
+            f"graph attribute {target} is not a tensor: {type(value)}"
+        )
+    return value
 
 
 def run_torch_decode_export_reference(
