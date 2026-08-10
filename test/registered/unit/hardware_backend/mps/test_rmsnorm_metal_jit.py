@@ -8,6 +8,12 @@ from unittest import mock
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.fused_op import (
+    clear_fused_op_trace,
+    disable_fused_op_trace,
+    enable_fused_op_trace,
+    get_fused_op_trace,
+)
 from sglang.kernels.ops.layernorm import _FUSED_ADD_RMSNORM, _RMSNORM
 from sglang.kernels.ops.layernorm._rmsnorm_metal_jit import (
     mps_fused_add_rmsnorm,
@@ -98,25 +104,38 @@ class TestMpsRMSNormMetalJit(unittest.TestCase):
                 self.assertEqual(fused_input.data_ptr(), input_pointer)
                 self.assertEqual(fused_residual.data_ptr(), residual_pointer)
 
+    def _dispatched_backend(self, op, *args) -> str:
+        clear_fused_op_trace()
+        enable_fused_op_trace()
+        try:
+            op.forward(*args)
+        finally:
+            disable_fused_op_trace()
+        records = get_fused_op_trace()
+        clear_fused_op_trace()
+        return records[-1].backend
+
     def test_unified_selector_uses_metal_jit_for_the_narrow_contract(self):
         x_cpu, residual_cpu, weight_cpu = self._inputs(1)
         x = x_cpu.to("mps")
         residual = residual_cpu.to("mps")
         weight = weight_cpu.to("mps")
         with torch.inference_mode():
-            self.assertIs(
-                _RMSNORM._resolve_backend(x, weight, 1e-6),
-                KernelBackend.METAL_JIT,
+            self.assertEqual(
+                self._dispatched_backend(_RMSNORM, x, weight, 1e-6),
+                KernelBackend.METAL_JIT.value,
             )
-            self.assertIs(
-                _FUSED_ADD_RMSNORM._resolve_backend(x, residual, weight, 1e-6),
-                KernelBackend.METAL_JIT,
+            self.assertEqual(
+                self._dispatched_backend(
+                    _FUSED_ADD_RMSNORM, x, residual, weight, 1e-6
+                ),
+                KernelBackend.METAL_JIT.value,
             )
 
             strided = torch.empty(1, 2048, device="mps", dtype=torch.bfloat16)[:, ::2]
-            self.assertIs(
-                _RMSNORM._resolve_backend(strided, weight, 1e-6),
-                KernelBackend.TORCH,
+            self.assertEqual(
+                self._dispatched_backend(_RMSNORM, strided, weight, 1e-6),
+                KernelBackend.TORCH.value,
             )
 
     def test_torch_provider_preserves_reference_semantics_and_out(self):

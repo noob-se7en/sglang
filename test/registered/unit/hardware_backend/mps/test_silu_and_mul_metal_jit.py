@@ -55,13 +55,23 @@ def test_qwen3_decode_shape_matches_torch_without_host_sync(rows):
     )
     reference = _reference(x)
     layer = _make_layer()
-    assert layer._forward_method.__func__ is SiluAndMul.forward_mps
 
-    with mock.patch.object(
-        torch.mps, "synchronize", wraps=torch.mps.synchronize
-    ) as synchronize:
-        result = layer(x)
+    clear_fused_op_trace()
+    enable_fused_op_trace()
+    try:
+        with mock.patch.object(
+            torch.mps, "synchronize", wraps=torch.mps.synchronize
+        ) as synchronize:
+            result = layer(x)
+    finally:
+        disable_fused_op_trace()
+    records = get_fused_op_trace()
+    clear_fused_op_trace()
 
+    # The layer routes through forward_mps to the unified op; assert on the
+    # unified op's record (the layer records its own platform entry after it).
+    op_records = [r for r in records if r.op == "activation.silu_and_mul"]
+    assert op_records[-1].backend == KernelBackend.METAL_JIT.value
     assert synchronize.call_count == 0
     assert result.shape == (rows, intermediate)
     assert result.dtype == torch.bfloat16

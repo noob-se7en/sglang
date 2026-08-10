@@ -163,6 +163,7 @@ _PLATFORM_METHODS: Dict[str, Tuple[str, ...]] = {
     "npu": ("forward_npu",),
     "xpu": ("forward_xpu",),
     "cpu": ("forward_cpu",),
+    "mps": ("forward_mps",),
 }
 
 
@@ -184,6 +185,7 @@ def _platform_key() -> str:
         is_cpu,
         is_cuda,
         is_hip,
+        is_mps,
         is_musa,
         is_npu,
         is_xpu,
@@ -201,6 +203,8 @@ def _platform_key() -> str:
         return "xpu"
     if is_musa():
         return "musa"
+    if is_mps():
+        return "mps"
     return ""
 
 
@@ -651,12 +655,22 @@ class BaseFusedOp(nn.Module, ABC):
         return method if method is not None else self.forward_native
 
     def _forward_backend_dynamic(self, *args, **kwargs):
-        """Per-call backend selection for ops with input-dependent gates."""
+        """Per-call backend selection for ops with input-dependent gates.
+
+        Traces the backend actually chosen for this call — the caller's
+        generic label would otherwise record the dispatcher itself.
+        """
         for backend in self._dynamic_backend_candidates:
             if self.backend_eligible(backend, *args, **kwargs):
-                return getattr(self, BACKEND_METHODS[backend])(*args, **kwargs)
-        method = self._platform_method(_platform_key())
-        return (method or self.forward_native)(*args, **kwargs)
+                result = getattr(self, BACKEND_METHODS[backend])(*args, **kwargs)
+                if _trace_enabled:
+                    _record_trace(self, backend.value, args, kwargs)
+                return result
+        method = self._platform_method(_platform_key()) or self.forward_native
+        result = method(*args, **kwargs)
+        if _trace_enabled:
+            _record_trace(self, _dispatch_label(method), args, kwargs)
+        return result
 
     def dispatch_forward(self) -> Callable:
         """The static dispatch target for this op on the current platform."""
@@ -741,7 +755,8 @@ class BaseFusedOp(nn.Module, ABC):
         if method is None:
             method = self._forward_method = self._resolve_forward_method()
         result = method(*args, **kwargs)
-        if _trace_enabled:
+        # The dynamic dispatcher records the backend it actually picked.
+        if _trace_enabled and method != self._forward_backend_dynamic:
             _record_trace(self, _dispatch_label(method), args, kwargs)
         return result
 
