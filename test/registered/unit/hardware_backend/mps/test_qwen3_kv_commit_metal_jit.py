@@ -11,9 +11,9 @@ from sglang.kernels.ops.kvcache._qwen3_deferred_kv_commit_metal_jit import (
     commit_deferred_kv,
     qwen3_commit_deferred_kv,
 )
-from sglang.test.ci.ci_register import register_mlx_ci
+from sglang.test.ci.ci_register import register_mps_ci
 
-register_mlx_ci(est_time=3, suite="stage-a-unit-test-mlx")
+register_mps_ci(est_time=3, suite="stage-a-unit-test-mps")
 
 _HAS_MPS_JIT = torch.backends.mps.is_available() and callable(
     getattr(torch.mps, "compile_shader", None)

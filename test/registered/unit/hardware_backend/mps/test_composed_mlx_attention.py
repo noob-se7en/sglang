@@ -8,9 +8,9 @@ import unittest
 import torch
 from packaging.version import Version
 
-from sglang.test.ci.ci_register import register_mlx_ci
+from sglang.test.ci.ci_register import register_mps_ci
 
-register_mlx_ci(est_time=2, suite="stage-a-unit-test-mlx")
+register_mps_ci(est_time=2, suite="stage-a-unit-test-mps")
 
 _HAS_SUPPORTED_RUNTIME = (
     importlib.util.find_spec("mlx") is not None

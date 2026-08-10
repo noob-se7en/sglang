@@ -1753,15 +1753,15 @@ class Qwen3MlxModelProvider:
         # asynchronous commit.
         self._pending_commit_sources = (new_k, new_v)
         phase_recorder = current_phase_recorder()
+
         def submit_kv_commit() -> None:
-            commit_deferred_kv(
+            qwen3_commit_deferred_kv(
                 new_k,
                 new_v,
                 forward_batch.out_cache_loc,
                 k_pools,
                 v_pools,
-                num_kv_heads=QWEN3_DEFERRED_ATTENTION_SPEC.num_kv_heads,
-                head_dim=QWEN3_DEFERRED_ATTENTION_SPEC.head_dim,
+                backend=self.kv_commit_backend,
             )
 
         if phase_recorder is None:
