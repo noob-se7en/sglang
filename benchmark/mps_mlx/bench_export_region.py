@@ -33,17 +33,13 @@ from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.hardware_backend.mlx.export_validation import (
     build_serving_forward_wrapper,
     build_serving_mlx_executor,
+    ensure_model_layers as _ensure_model_layers,
     export_serving_forward,
+    serving_export_context as _ensure_export_context,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.srt.model_executor.model_runner_components.layer_setup import (
-    compute_attention_and_moe_layers,
-)
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    set_tc_piecewise_forward_context,
-)
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -87,33 +83,6 @@ def _time_call(fn, *, device: str, warmup: int, repeat: int) -> dict[str, Any]:
         "repeat": repeat,
         "warmup": warmup,
     }
-
-
-def _ensure_export_context(model_runner: Any, forward_batch: ForwardBatch) -> Any:
-    _ensure_model_layers(model_runner)
-    return set_tc_piecewise_forward_context(
-        forward_batch,
-        model_runner.attention_layers,
-        getattr(model_runner.model, "quant_config", None),
-        model_runner.moe_layers,
-        model_runner.moe_fusions,
-        dsa_indexers=model_runner.dsa_indexers,
-        mha_companion_layers=model_runner.mha_companion_layers,
-        full_graph=True,
-    )
-
-
-def _ensure_model_layers(model_runner: Any) -> None:
-    if hasattr(model_runner, "attention_layers"):
-        return
-    layer_model = getattr(model_runner.model, "model", model_runner.model)
-    (
-        model_runner.attention_layers,
-        model_runner.moe_layers,
-        model_runner.moe_fusions,
-        model_runner.dsa_indexers,
-        model_runner.mha_companion_layers,
-    ) = compute_attention_and_moe_layers(layer_model)
 
 
 def _prepare_prefill_batch(

@@ -726,6 +726,10 @@ class Envs:
     # Torch Compile
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
 
+    # Apple MPS: serve decode through the exported whole-model MLX region
+    # (experimental; falls back to the eager Torch path per batch size).
+    SGLANG_ENABLE_MPS_WHOLE_REGION = EnvBool(False)
+
     # EPLB
     SGLANG_EXPERT_LOCATION_UPDATER_LOG_INPUT = EnvBool(False)
     SGLANG_EXPERT_LOCATION_UPDATER_CANARY = EnvBool(False)

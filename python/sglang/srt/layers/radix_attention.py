@@ -175,6 +175,9 @@ class RadixAttention(nn.Module):
         if (
             (
                 forward_batch.forward_mode.is_extend()
+                # torch.export always traces the semantic attention op; the
+                # raw backend call is an eager-only shape.
+                or torch.compiler.is_exporting()
                 or os.environ.get("SGLANG_MLX_CAPTURE_REPORT")
                 or os.environ.get("SGLANG_MLX_EXPORT_VALIDATE")
             )
@@ -271,7 +274,9 @@ class RadixAttention(nn.Module):
                     else unified_attention_with_output
                 )
             export_state = {}
-            if os.environ.get("SGLANG_MLX_EXPORT_VALIDATE"):
+            if torch.compiler.is_exporting() or os.environ.get(
+                "SGLANG_MLX_EXPORT_VALIDATE"
+            ):
                 attn_backend = get_attn_backend()
                 k_cache, v_cache = attn_backend.token_to_kv_pool.get_kv_buffer(
                     self.layer_id

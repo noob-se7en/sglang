@@ -95,14 +95,14 @@ class ServingForwardExportWrapper(torch.nn.Module):
         )
 
 
-def build_serving_forward_wrapper(
-    model_runner: Any,
-    forward_batch: ForwardBatch,
-) -> tuple[ServingForwardExportWrapper, tuple[Any, ...]]:
-    wrapper = ServingForwardExportWrapper(
-        model_runner.model, model_runner, forward_batch
-    ).eval()
-    args = (
+def serving_forward_args(forward_batch: ForwardBatch) -> tuple[Any, ...]:
+    """The flat tensor signature shared by export, validation, and serving.
+
+    Order is load-bearing: the exported program's placeholders and the MLX
+    executor's ``out_cache_loc`` position are derived from it, so every
+    caller must build the tuple through this function.
+    """
+    return (
         forward_batch.input_ids,
         forward_batch.positions,
         forward_batch.req_pool_indices,
@@ -113,7 +113,53 @@ def build_serving_forward_wrapper(
         forward_batch.extend_start_loc,
         forward_batch.num_token_non_padded,
     )
-    return wrapper, args
+
+
+def ensure_model_layers(model_runner: Any) -> None:
+    """Populate the layer maps the export wrapper reads, once per runner."""
+    from sglang.srt.model_executor.model_runner_components.layer_setup import (
+        compute_attention_and_moe_layers,
+    )
+
+    if hasattr(model_runner, "attention_layers"):
+        return
+    layer_model = getattr(model_runner.model, "model", model_runner.model)
+    (
+        model_runner.attention_layers,
+        model_runner.moe_layers,
+        model_runner.moe_fusions,
+        model_runner.dsa_indexers,
+        model_runner.mha_companion_layers,
+    ) = compute_attention_and_moe_layers(layer_model)
+
+
+def serving_export_context(model_runner: Any, forward_batch: ForwardBatch) -> Any:
+    """The forward context torch.export needs to trace the serving forward."""
+    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+        set_tc_piecewise_forward_context,
+    )
+
+    ensure_model_layers(model_runner)
+    return set_tc_piecewise_forward_context(
+        forward_batch,
+        model_runner.attention_layers,
+        getattr(model_runner.model, "quant_config", None),
+        model_runner.moe_layers,
+        model_runner.moe_fusions,
+        dsa_indexers=model_runner.dsa_indexers,
+        mha_companion_layers=model_runner.mha_companion_layers,
+        full_graph=True,
+    )
+
+
+def build_serving_forward_wrapper(
+    model_runner: Any,
+    forward_batch: ForwardBatch,
+) -> tuple[ServingForwardExportWrapper, tuple[Any, ...]]:
+    wrapper = ServingForwardExportWrapper(
+        model_runner.model, model_runner, forward_batch
+    ).eval()
+    return wrapper, serving_forward_args(forward_batch)
 
 
 def build_serving_mlx_executor(

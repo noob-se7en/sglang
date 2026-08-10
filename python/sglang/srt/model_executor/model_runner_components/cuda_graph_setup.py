@@ -181,6 +181,22 @@ def capture_cuda_graphs(
             current_platform.is_out_of_tree() and current_platform.support_cuda_graph()
         ):
             decode = capture_decode_graph(model_runner=model_runner)
+        elif (
+            model_runner.device == "mps"
+            and not model_runner.is_draft_worker
+            and envs.SGLANG_ENABLE_MPS_WHOLE_REGION.get()
+        ):
+            # Not a CUDA graph: decode executes as one exported MLX region
+            # over Torch-owned serving state (exported lazily per batch
+            # size, eager Torch fallback for everything else).
+            from sglang.srt.hardware_backend.mlx.region_runner import MlxRegionRunner
+
+            decode = GraphCapture(
+                runner=MlxRegionRunner(model_runner),
+                memory_phase=decode_phase,
+                memory_usage_gb=0,
+                capture_time=0,
+            )
     else:
         decode = GraphCapture(
             runner=eager_runner,
