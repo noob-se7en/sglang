@@ -229,8 +229,25 @@ def test_same_mlx_executor_runs_real_sglang_mlp_architectures(architecture):
     _CONTEXT.set_server_args(
         SimpleNamespace(rl_on_policy_target=None, enable_torch_compile=False)
     )
+    deterministic_exec = SimpleNamespace(
+        deterministic=SimpleNamespace(rl_on_policy_target=None)
+    )
+
+    def get_deterministic_exec():
+        return deterministic_exec
+
     try:
-        with get_parallel().override(tp_size=1, tp_rank=0):
+        with (
+            get_parallel().override(tp_size=1, tp_rank=0),
+            mock.patch(
+                "sglang.srt.layers.activation.get_exec",
+                new=get_deterministic_exec,
+            ),
+            mock.patch(
+                "sglang.srt.models.qwen2.get_exec",
+                new=get_deterministic_exec,
+            ),
+        ):
             if architecture == "qwen3":
                 model = Qwen3MLP(8, 16, "silu")
             else:

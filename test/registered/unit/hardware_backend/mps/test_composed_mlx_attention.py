@@ -148,10 +148,18 @@ class TestQwen3MlxDeferredDecode(unittest.TestCase):
         )
 
     def test_cold_prefill_causal_gqa_matches_torch(self):
-        from sglang.srt.hardware_backend.mlx.qwen3_decode import _mlx_causal_gqa
+        from sglang.kernels.ops.attention.mlx_radix_attention import (
+            DeferredAttentionSpec,
+            causal_gqa,
+        )
         from sglang.srt.utils.tensor_bridge import mlx_call
 
         torch.manual_seed(20260802)
+        spec = DeferredAttentionSpec(num_q_heads=16, num_kv_heads=8, head_dim=128)
+
+        def operation(q, k, v):
+            return causal_gqa(q, k, v, spec=spec)
+
         for token_count in (1, 2, 17):
             with self.subTest(token_count=token_count):
                 q = torch.randn(
@@ -159,7 +167,7 @@ class TestQwen3MlxDeferredDecode(unittest.TestCase):
                 )
                 k = torch.randn(token_count, 8, 128, device="mps", dtype=torch.bfloat16)
                 v = torch.randn_like(k)
-                output = mlx_call(_mlx_causal_gqa, q, k, v, device="mps")
+                output = mlx_call(operation, q, k, v, device="mps")
                 reference = torch.nn.functional.scaled_dot_product_attention(
                     q.transpose(0, 1)[None, ...],
                     k.transpose(0, 1)[None, ...],
