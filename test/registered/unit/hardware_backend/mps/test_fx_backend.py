@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -16,9 +17,9 @@ from sglang.srt.hardware_backend.mlx.fx_backend import (
     export_mlx_plan,
     make_mlx_fx_executor,
 )
-from sglang.test.ci.ci_register import register_mlx_ci
+from sglang.test.ci.ci_register import register_mps_ci
 
-register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
+register_mps_ci(est_time=1, suite="stage-a-unit-test-mps")
 
 _HAS_WHOLE_GRAPH_MLX_RUNTIME = (
     torch.backends.mps.is_available() and Version(torch.__version__) >= Version("2.13")
@@ -319,8 +320,25 @@ def test_real_qwen3_mlp_exports_without_an_architecture_registry():
     _CONTEXT.set_server_args(
         SimpleNamespace(rl_on_policy_target=None, enable_torch_compile=False)
     )
+    deterministic_exec = SimpleNamespace(
+        deterministic=SimpleNamespace(rl_on_policy_target=None)
+    )
+
+    def get_deterministic_exec():
+        return deterministic_exec
+
     try:
-        with get_parallel().override(tp_size=1, tp_rank=0):
+        with (
+            get_parallel().override(tp_size=1, tp_rank=0),
+            mock.patch(
+                "sglang.srt.layers.activation.get_exec",
+                new=get_deterministic_exec,
+            ),
+            mock.patch(
+                "sglang.srt.models.qwen2.get_exec",
+                new=get_deterministic_exec,
+            ),
+        ):
             model = Qwen3MLP(8, 16, "silu").eval()
             gate_up_projection = model.gate_up_proj
             down_projection = model.down_proj
