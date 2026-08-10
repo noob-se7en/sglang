@@ -1,9 +1,12 @@
-"""Benchmark strict-export Torch MPS vs whole-region MLX execution.
+"""Benchmark an exported Torch reference against whole-region MLX execution.
 
 This is a validation benchmark, not a production runtime path. It prepares real
 SGLang serving batches, exports the transformer body plus LM head, and times the
 raw exported region without the correctness reference work used by
 ``SGLANG_MLX_EXPORT_VALIDATE``.
+
+It must not be used as a production Torch+MPS baseline. That baseline is run
+from an unmodified SGLang main checkout through ``one_batch``.
 """
 
 from __future__ import annotations
@@ -667,15 +670,15 @@ def _benchmark_bucket(
         "seed": seed,
         "tokens": sum(input_lens),
         "mode": mlx_region.execution_mode,
-        "torch_mps_exported_region": torch_timing,
+        "exported_torch_reference": torch_timing,
         "mlx_exported_region": mlx_timing,
         # Raw timing is diagnostic until serving-output parity is established.
-        "raw_speedup": (
+        "exported_region_raw_speedup": (
             torch_timing["median_ms"] / mlx_timing["median_ms"]
             if mlx_timing["median_ms"]
             else None
         ),
-        "speedup": (
+        "exported_region_speedup": (
             torch_timing["median_ms"] / mlx_timing["median_ms"]
             if valid_for_performance and mlx_timing["median_ms"]
             else None
@@ -814,8 +817,8 @@ def main() -> None:
                     if result["generation_parity"] is None
                     else result["generation_parity"]["all_tokens_match"]
                 ),
-                "raw_speedup": result["raw_speedup"],
-                "speedup": result["speedup"],
+                "exported_region_raw_speedup": result["exported_region_raw_speedup"],
+                "exported_region_speedup": result["exported_region_speedup"],
             },
             indent=2,
             sort_keys=True,
