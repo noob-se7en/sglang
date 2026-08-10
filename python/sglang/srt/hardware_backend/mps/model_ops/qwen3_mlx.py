@@ -31,7 +31,15 @@ import torch
 
 from sglang.kernels.ops.attention import (
     qwen3_radix_decode_deferred,
+)
+from sglang.kernels.ops.attention._qwen3_mlx_metal import (
     warmup_qwen3_radix_decode_deferred,
+)
+from sglang.kernels.ops.attention.mlx_kv_commit import commit_deferred_kv
+from sglang.kernels.ops.attention.mlx_radix_attention import (
+    DeferredAttentionSpec,
+    causal_gqa,
+    radix_decode_deferred,
 )
 from sglang.kernels.ops.attention.qwen3_mps import QWEN3_06B_METAL_SPEC
 from sglang.kernels.ops.kvcache import (
@@ -40,6 +48,12 @@ from sglang.kernels.ops.kvcache import (
 )
 from sglang.kernels.spec import KernelBackend
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.hardware_backend.mlx.transformer_blocks import (
+    DenseGqaDecoderLayer,
+    DenseGqaDecoderTopology,
+    DenseGqaSpec,
+    run_dense_gqa_swiglu_decoder,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -52,7 +66,6 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.utils._phase_timing import current_phase_recorder, measure_phase
 from sglang.srt.utils.tensor_bridge import (
-    MlxTensorView,
     borrow_torch_tensors,
     mlx_call_multi,
 )
@@ -71,6 +84,13 @@ def _configure_mlx_memory_cache() -> None:
     import mlx.core as mx
 
     mx.set_cache_limit(MLX_WHOLE_MODEL_CACHE_LIMIT_BYTES)
+
+
+QWEN3_DEFERRED_ATTENTION_SPEC = DeferredAttentionSpec(
+    num_q_heads=QWEN3_06B_METAL_SPEC.num_q_heads,
+    num_kv_heads=QWEN3_06B_METAL_SPEC.num_kv_heads,
+    head_dim=QWEN3_06B_METAL_SPEC.head_dim,
+)
 
 
 def _single_cpu_int(value: Any) -> Optional[int]:
@@ -102,32 +122,10 @@ def _is_mps_vector(
     )
 
 
-@dataclass(frozen=True)
-class _LayerViews:
-    input_norm: MlxTensorView
-    qkv: MlxTensorView
-    q_norm: MlxTensorView
-    k_norm: MlxTensorView
-    rope_cache: MlxTensorView
-    o_proj: MlxTensorView
-    post_attention_norm: MlxTensorView
-    gate_up: MlxTensorView
-    down: MlxTensorView
-    k_pool: MlxTensorView
-    v_pool: MlxTensorView
-    input_epsilon: float
-    qk_epsilon: float
-    post_attention_epsilon: float
-
-
-@dataclass(frozen=True)
-class _DecodeViews:
-    embedding: MlxTensorView
-    layers: tuple[_LayerViews, ...]
-    final_norm: MlxTensorView
-    final_epsilon: float
-    pool_identity: int
-    pool_slots: int
+# Backwards-compatible local names while Qwen3 remains the first topology
+# adapter. The implementation belongs to reusable MLX decoder primitives.
+_LayerViews = DenseGqaDecoderLayer
+_DecodeViews = DenseGqaDecoderTopology
 
 
 @dataclass(frozen=True)
@@ -937,56 +935,18 @@ def _mlx_model_graph(
     *,
     share_qk_rope: bool = False,
 ):
-    """Build the shared lazy transformer and return hidden plus deferred K/V."""
-    import mlx.core as mx
-
-    hidden = mx.take(views.embedding.array, input_ids, axis=0)
-    residual = None
-    new_keys = []
-    new_values = []
-    spec = QWEN3_06B_METAL_SPEC
-
-    for layer in views.layers:
-        if residual is None:
-            residual = hidden
-            normed = _rms_norm(hidden, layer.input_norm.array, layer.input_epsilon)
-        else:
-            normed, residual = _add_rms_norm(
-                hidden,
-                residual,
-                layer.input_norm.array,
-                layer.input_epsilon,
-            )
-        qkv = normed @ mx.transpose(layer.qkv.array)
-        q, k, v = _prepare_qkv(
-            qkv,
-            layer,
-            positions,
-            share_qk_rope=share_qk_rope,
-        )
-        batch = q.shape[0]
-
-        attention = attention_forward(layer, q, k, v)
-        attention = attention.reshape(batch, spec.num_q_heads * spec.head_dim)
-        attention = attention @ mx.transpose(layer.o_proj.array)
-        mlp_input, residual = _add_rms_norm(
-            attention,
-            residual,
-            layer.post_attention_norm.array,
-            layer.post_attention_epsilon,
-        )
-        gate_up = mlp_input @ mx.transpose(layer.gate_up.array)
-        gate, up = mx.split(gate_up, 2, axis=-1)
-        hidden = _swiglu(gate, up) @ mx.transpose(layer.down.array)
-        new_keys.append(k)
-        new_values.append(v)
-
-    hidden, _ = _add_rms_norm(
-        hidden, residual, views.final_norm.array, views.final_epsilon
+    """Compose the Qwen3 topology with reusable MLX decoder blocks."""
+    return run_dense_gqa_swiglu_decoder(
+        views,
+        input_ids,
+        positions,
+        spec=DenseGqaSpec(
+            num_q_heads=QWEN3_06B_METAL_SPEC.num_q_heads,
+            num_kv_heads=QWEN3_06B_METAL_SPEC.num_kv_heads,
+            head_dim=QWEN3_06B_METAL_SPEC.head_dim,
+        ),
+        attention_forward=attention_forward,
     )
-    # Layer-major layout lets the Torch commit kernel consume both 14-layer
-    # halves as contiguous ranges without materializing a transpose.
-    return hidden, mx.stack(new_keys, axis=0), mx.stack(new_values, axis=0)
 
 
 def _mlx_decode_graph(
@@ -1000,7 +960,7 @@ def _mlx_decode_graph(
     """Build one decode graph over the Torch-owned Radix prefix."""
 
     def attention_forward(layer, q, k, v):
-        return qwen3_radix_decode_deferred(
+        return radix_decode_deferred(
             q,
             k,
             v,
@@ -1009,7 +969,7 @@ def _mlx_decode_graph(
             req_to_token,
             req_pool_indices,
             seq_lens,
-            scale=QWEN3_06B_METAL_SPEC.attention_scale,
+            spec=QWEN3_DEFERRED_ATTENTION_SPEC,
         )
 
     return _mlx_model_graph(views, input_ids, positions, attention_forward)
@@ -1045,19 +1005,7 @@ def _mlx_decode_greedy_graph(
 
 def _mlx_causal_gqa(q, k, v):
     """Run causal 16:8 GQA over one flattened prefix-free request."""
-    import mlx.core as mx
-
-    q_sdpa = q.transpose(1, 0, 2)[None, ...]
-    k_sdpa = k.transpose(1, 0, 2)[None, ...]
-    v_sdpa = v.transpose(1, 0, 2)[None, ...]
-    output = mx.fast.scaled_dot_product_attention(
-        q_sdpa,
-        k_sdpa,
-        v_sdpa,
-        scale=QWEN3_06B_METAL_SPEC.attention_scale,
-        mask="causal",
-    )
-    return output[0].transpose(1, 0, 2)
+    return causal_gqa(q, k, v, spec=QWEN3_DEFERRED_ATTENTION_SPEC)
 
 
 def _mlx_cold_prefill_graph(
@@ -1804,29 +1752,21 @@ class Qwen3MlxModelProvider:
         # caller can fail the worker cleanly rather than observe a half-owned
         # asynchronous commit.
         self._pending_commit_sources = (new_k, new_v)
-
         phase_recorder = current_phase_recorder()
-        if phase_recorder is None:
-            qwen3_commit_deferred_kv(
+        def submit_kv_commit() -> None:
+            commit_deferred_kv(
                 new_k,
                 new_v,
                 forward_batch.out_cache_loc,
                 k_pools,
                 v_pools,
-                backend=self.kv_commit_backend,
+                num_kv_heads=QWEN3_DEFERRED_ATTENTION_SPEC.num_kv_heads,
+                head_dim=QWEN3_DEFERRED_ATTENTION_SPEC.head_dim,
             )
+
+        if phase_recorder is None:
+            submit_kv_commit()
         else:
-
-            def submit_kv_commit() -> None:
-                qwen3_commit_deferred_kv(
-                    new_k,
-                    new_v,
-                    forward_batch.out_cache_loc,
-                    k_pools,
-                    v_pools,
-                    backend=self.kv_commit_backend,
-                )
-
             measure_phase(phase_recorder, "kv_commit_submit", submit_kv_commit)
         self.call_count += 1
         if is_cold_prefill:

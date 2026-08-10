@@ -2660,6 +2660,8 @@ def direct_register_custom_op(
             my_lib.impl(op_name, op_func, "XPU")
         elif is_musa():
             my_lib.impl(op_name, op_func, "MUSA")
+        elif is_mps():
+            my_lib.impl(op_name, op_func, "MPS")
         else:
             my_lib.impl(op_name, op_func, "CUDA")
         if fake_impl is not None:
