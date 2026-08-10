@@ -561,6 +561,8 @@ def _make_mlx_export_executor(
         new_keys = []
         new_values = []
         attention_outputs = []
+        first_query = None
+        first_key = None
         first_value = None
         for node, node_plan in zip(graph_module.graph.nodes, plan.nodes):
             if node.op in {"placeholder", "get_attr"}:
@@ -574,6 +576,8 @@ def _make_mlx_export_executor(
                     return (
                         *outputs,
                         mx.stack(attention_outputs),
+                        first_query,
+                        first_key,
                         first_value,
                         mx.stack(new_keys),
                         mx.stack(new_values),
@@ -625,6 +629,9 @@ def _make_mlx_export_executor(
                     )
                 output[:] = attention.reshape(output.shape)
                 attention_outputs.append(attention)
+                if first_query is None:
+                    first_query = query
+                    first_key = key
                 if first_value is None:
                     first_value = value
                 new_keys.append(key)
@@ -648,14 +655,14 @@ def _make_mlx_export_executor(
             *attr_views,
             device="mps",
         )
-        expected_results = 5 if debug_attention else 3
+        expected_results = 7 if debug_attention else 3
         if len(results) != expected_results:
             raise RuntimeError(
                 "MLX graph expected logits, optional debug attention, and two KV "
                 f"deltas; got {len(results)}"
             )
         if debug_attention:
-            logits, all_attention, first_value, new_k, new_v = results
+            logits, all_attention, first_query, first_key, first_value, new_k, new_v = results
         else:
             logits, new_k, new_v = results
         if os.environ.get("SGLANG_MLX_EXPORT_DEBUG_KV_DELTAS"):
@@ -680,7 +687,9 @@ def _make_mlx_export_executor(
             head_dim=spec.head_dim,
         )
         return (
-            (logits, all_attention, first_value) if debug_attention else logits
+            (logits, all_attention, first_query, first_key, first_value)
+            if debug_attention
+            else logits
         )
 
     return execute
@@ -738,6 +747,7 @@ def run_torch_decode_export_reference(
 
 _TORCH_DECODE_DEBUG_ATTENTION: list[torch.Tensor] = []
 _TORCH_PREFILL_DEBUG_ATTENTION: list[torch.Tensor] = []
+_TORCH_PREFILL_DEBUG_QKV: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
 
 def run_torch_prefill_export_reference(
@@ -754,9 +764,14 @@ def run_torch_prefill_export_reference(
             node.target = _torch_radix_prefill_reference
     graph_module.recompile()
     _TORCH_PREFILL_DEBUG_ATTENTION.clear()
+    _TORCH_PREFILL_DEBUG_QKV.clear()
     logits = graph_module(*runtime_inputs)
     if return_first_attention:
-        return logits, torch.stack(_TORCH_PREFILL_DEBUG_ATTENTION)
+        return (
+            logits,
+            torch.stack(_TORCH_PREFILL_DEBUG_ATTENTION),
+            _TORCH_PREFILL_DEBUG_QKV[0],
+        )
     return logits
 
 
@@ -783,6 +798,9 @@ def _torch_radix_prefill_reference(
     q = query.reshape(query.shape[0], num_q_heads, head_dim)
     current_k = key.reshape(key.shape[0], num_kv_heads, head_dim)
     current_v = value.reshape(value.shape[0], num_kv_heads, head_dim)
+    _TORCH_PREFILL_DEBUG_QKV.append(
+        (q.detach().clone(), current_k.detach().clone(), current_v.detach().clone())
+    )
     q_per_kv = num_q_heads // num_kv_heads
     rows = []
     request_start = 0

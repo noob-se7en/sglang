@@ -280,16 +280,28 @@ def export_serving_forward(
                 exported, args, return_first_attention=debug_attention
             )
             if debug_attention:
-                torch_logits, torch_attention = torch_reference
+                torch_logits, torch_attention, torch_first_qkv = torch_reference
+                torch_first_query, torch_first_key, torch_first_value = torch_first_qkv
             else:
                 torch_logits = torch_reference
                 torch_attention = None
+                torch_first_query = None
+                torch_first_key = None
+                torch_first_value = None
         mlx_result = mlx_executor(*args)
         if debug_attention:
-            mlx_logits, mlx_attention, mlx_first_value = mlx_result
+            (
+                mlx_logits,
+                mlx_attention,
+                mlx_first_query,
+                mlx_first_key,
+                mlx_first_value,
+            ) = mlx_result
         else:
             mlx_logits = mlx_result
             mlx_attention = None
+            mlx_first_query = None
+            mlx_first_key = None
             mlx_first_value = None
         torch.mps.synchronize()
         difference = (mlx_logits.float() - torch_logits.float()).abs()
@@ -340,6 +352,19 @@ def export_serving_forward(
                 report["execution"][
                     "mlx_first_token_causal_max_abs_error"
                 ] = float(first_token_difference.max().cpu())
+            if torch_first_value is not None and mlx_first_value is not None:
+                for name, mlx_value, torch_value in (
+                    ("query", mlx_first_query, torch_first_query),
+                    ("key", mlx_first_key, torch_first_key),
+                    ("value", mlx_first_value, torch_first_value),
+                ):
+                    difference = (mlx_value.float() - torch_value.float()).abs()
+                    report["execution"][f"first_{name}_max_abs_error"] = float(
+                        difference.max().cpu()
+                    )
+                    report["execution"][f"first_{name}_mean_abs_error"] = float(
+                        difference.mean().cpu()
+                    )
     Path(report_path).write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     if os.environ.get("SGLANG_MLX_EXPORT_SAVE") and forward_batch.forward_mode.is_decode():
         torch.export.save(exported, report_path + ".pt2")

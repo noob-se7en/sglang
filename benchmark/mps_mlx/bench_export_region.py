@@ -660,8 +660,11 @@ def _benchmark_bucket(
         else:
             os.environ["SGLANG_MLX_EXPORT_DEBUG_KV_DELTAS"] = previous_delta_debug
 
+    # A tolerance-only logit check can mask a top-1 change that compounds during
+    # autoregressive decode.  Timed results are comparable only after every
+    # lockstep greedy token agrees with the Torch reference.
     valid_for_performance = logit_metrics["valid"] and direct_kv_valid and (
-        generation_parity is None or generation_parity["all_steps_valid"]
+        generation_parity is None or generation_parity["all_tokens_match"]
     )
     return {
         "batch_size": batch_size,
