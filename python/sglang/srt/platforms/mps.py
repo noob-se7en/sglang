@@ -10,6 +10,7 @@ through to the base ``SRTPlatform``.
 
 from __future__ import annotations
 
+import os
 import platform as _platform
 from typing import Optional
 
@@ -163,13 +164,35 @@ class MpsSRTPlatform(MpsDeviceMixin, SRTPlatform):
             model_config,
             lora_enabled=bool(getattr(server_args, "enable_lora", False)),
         )
-        return install_mps_operators(
+        capture_report = os.environ.get("SGLANG_MLX_CAPTURE_REPORT")
+        if capture_report:
+            from sglang.srt.compilation.torch_compile_decoration import _to_torch
+            from sglang.srt.hardware_backend.mlx.fx_backend import (
+                MlxFxCaptureBackend,
+            )
+
+            _to_torch(model, reverse=False, num_tokens=1)
+            model.forward = torch.compile(
+                model.forward,
+                backend=MlxFxCaptureBackend(
+                    fallback_to_torch=True,
+                    report_path=capture_report,
+                ),
+                fullgraph=True,
+            )
+            return None
+
+        if os.environ.get("SGLANG_MLX_EXPORT_VALIDATE"):
+            return None
+
+        report = install_mps_operators(
             model=model,
             model_config=model_config,
             server_args=server_args,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool=token_to_kv_pool,
         )
+        return report
 
     def get_default_attention_backend(self) -> str:
         return "mps"
