@@ -184,7 +184,7 @@ def capture_cuda_graphs(
         elif (
             model_runner.device == "mps"
             and not model_runner.is_draft_worker
-            and envs.SGLANG_ENABLE_MPS_WHOLE_REGION.get()
+            and envs.SGLANG_ENABLE_MLX_WHOLE_REGION.get()
         ):
             # Not a CUDA graph: decode executes as one exported MLX region
             # over Torch-owned serving state (exported lazily per batch
