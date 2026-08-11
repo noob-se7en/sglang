@@ -729,8 +729,9 @@ class RMSNorm(BaseFusedOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """Use the narrow Qwen3-0.6B Metal kernel and otherwise stay native."""
+        """Use the narrow Metal kernel contract and otherwise stay native."""
         # Keep the global fused-op override useful for A/B diagnostics.  The
         # semantic RMSNorm objects are configured once by the MPS model-op
         # plan, then their pinned per-instance order is used here; this avoids
@@ -739,7 +740,9 @@ class RMSNorm(BaseFusedOp):
         from sglang.kernels.spec import KernelBackend
 
         if get_fused_op_backend() is KernelBackend.TORCH:
-            return self.forward_native(x, residual, post_residual_addition)
+            return self.forward_native(
+                x, residual, post_residual_addition, quant_linear
+            )
         # These options alter either reduction semantics, output dtype, or the
         # residual contract.  Keep them on the existing Torch implementation.
         if (
@@ -749,6 +752,7 @@ class RMSNorm(BaseFusedOp):
             or self.fp32_residual
             or self.override_orig_dtype is not None
             or post_residual_addition is not None
+            or quant_linear is not None
             or is_batch_invariant_mode_enabled()
             or (
                 torch.is_grad_enabled()
@@ -759,7 +763,9 @@ class RMSNorm(BaseFusedOp):
                 )
             )
         ):
-            return self.forward_native(x, residual, post_residual_addition)
+            return self.forward_native(
+                x, residual, post_residual_addition, quant_linear
+            )
 
         from sglang.kernels.ops.layernorm import _FUSED_ADD_RMSNORM, _RMSNORM
         from sglang.kernels.ops.layernorm._rmsnorm_metal_jit import (
