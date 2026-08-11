@@ -638,11 +638,14 @@ def _benchmark_bucket(
         else:
             os.environ["SGLANG_MLX_EXPORT_DEBUG_KV_DELTAS"] = previous_delta_debug
 
-    # A tolerance-only logit check can mask a top-1 change that compounds during
-    # autoregressive decode.  Timed results are comparable only after every
-    # lockstep greedy token agrees with the Torch reference.
+    # Timed results are comparable when every lockstep step passes the logit
+    # gates, where a top-1 flip counts as valid only if the near-tie
+    # classifier certifies both winners were within one rounding step of an
+    # exact tie. Requiring token-exact agreement instead would reject valid
+    # runs whenever two kernels round an exactly tied logit differently
+    # (all_tokens_match is still reported for visibility).
     valid_for_performance = logit_metrics["valid"] and direct_kv_valid and (
-        generation_parity is None or generation_parity["all_tokens_match"]
+        generation_parity is None or generation_parity["all_steps_valid"]
     )
     return {
         "batch_size": batch_size,

@@ -162,6 +162,30 @@ def build_serving_forward_wrapper(
     return wrapper, serving_forward_args(forward_batch)
 
 
+def serving_graph_signature(
+    model_runner: Any, forward_batch: ForwardBatch
+) -> tuple[str, ...]:
+    """The exported graph's op sequence, for constant-independence checks.
+
+    The wrapper bakes Python-scalar batch fields (``seq_lens_sum``,
+    ``num_token_non_padded_cpu``) as constants. Reusing one executor across
+    steps is only sound if the traced graph does not depend on them; callers
+    compare this signature across exports with perturbed constants.
+    """
+    from sglang.srt.compilation.torch_compile_decoration import _to_torch
+
+    _to_torch(
+        model_runner.model,
+        reverse=False,
+        num_tokens=forward_batch.input_ids.shape[0],
+    )
+    wrapper, args = build_serving_forward_wrapper(model_runner, forward_batch)
+    exported = torch.export.export(wrapper, args, strict=False)
+    return tuple(
+        f"{node.op}:{node.target}" for node in exported.graph_module.graph.nodes
+    )
+
+
 def build_serving_mlx_executor(
     model_runner: Any,
     forward_batch: ForwardBatch,

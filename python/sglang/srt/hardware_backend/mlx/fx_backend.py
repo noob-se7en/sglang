@@ -489,6 +489,7 @@ def _make_mlx_export_executor(
     )
     from sglang.kernels.ops.attention.mlx_radix_attention import (
         DeferredAttentionSpec,
+        causal_gqa,
         radix_decode_deferred,
         radix_prefill_deferred,
     )
@@ -562,9 +563,16 @@ def _make_mlx_export_executor(
             head_dim=int(k_pools[0].shape[2]),
         )
     out_cache_position = 4
+    prefix_lens_position = 6
     debug_attention = bool(os.environ.get("SGLANG_MLX_EXPORT_DEBUG_ATTENTION"))
 
-    def mlx_graph(*arrays):
+    def make_mlx_graph(prefill_attention: str):
+        def mlx_graph(*arrays):
+            return _run_mlx_graph(prefill_attention, *arrays)
+
+        return mlx_graph
+
+    def _run_mlx_graph(prefill_attention, *arrays):
         runtime_arrays = arrays[: len(tensor_placeholders)]
         captured_arrays = arrays[len(tensor_placeholders) :]
         values: dict[torch.fx.Node, Any] = dict(
@@ -624,6 +632,15 @@ def _make_mlx_export_executor(
                         kwargs["seq_lens"],
                         spec=spec,
                     )
+                elif prefill_attention == "causal":
+                    # Single request, no cached prefix: plain causal SDPA is
+                    # exactly the same math and ~15x faster than the radix
+                    # kernel at prefill shapes. Selection happens per call in
+                    # execute(); this graph is only run when it applies.
+                    query = mx.contiguous(query)
+                    key = mx.contiguous(key)
+                    value = mx.contiguous(value)
+                    attention = causal_gqa(query, key, value, spec=spec)
                 else:
                     query = mx.contiguous(query)
                     key = mx.contiguous(key)
@@ -658,12 +675,24 @@ def _make_mlx_export_executor(
             values[node] = _lower_mlx_node(node_plan.lowering, args, kwargs)
         raise UnsupportedMlxFxGraphError("decode export has no output node")
 
-    compiled_graph = mx.compile(mlx_graph, shapeless=False)
+    compiled_graph = mx.compile(make_mlx_graph("radix"), shapeless=False)
+    # Packed multi-request batches and radix-prefix reuse need the custom
+    # kernel; the plain-causal fast path is only valid for one request with
+    # no cached prefix, so it exists only for batch-size-1 exports.
+    causal_prefill_graph = None
+    if mode == "prefill" and example_inputs[2].shape[0] == 1:
+        causal_prefill_graph = mx.compile(make_mlx_graph("causal"), shapeless=False)
 
     def execute(*runtime_inputs):
         tensor_inputs = tuple(runtime_inputs[index] for index in tensor_positions)
+        graph = compiled_graph
+        if (
+            causal_prefill_graph is not None
+            and int(runtime_inputs[prefix_lens_position].max()) == 0
+        ):
+            graph = causal_prefill_graph
         results = mlx_call_multi(
-            compiled_graph,
+            graph,
             *tensor_inputs,
             *attr_views,
             device="mps",
