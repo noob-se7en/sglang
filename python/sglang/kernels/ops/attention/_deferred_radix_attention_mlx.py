@@ -39,6 +39,38 @@ class DeferredAttentionSpec:
     def attention_scale(self) -> float:
         return self.head_dim**-0.5
 
+
+def deferred_attention_reject_reason(
+    *, num_q_heads: int, num_kv_heads: int, head_dim: int
+) -> str | None:
+    """Why this head geometry cannot launch the deferred kernels, or None.
+
+    One simdgroup owns one token: each of its ``_SIMD_SIZE`` lanes carries
+    ``head_dim / _SIMD_SIZE`` adjacent components (``VALUES_PER_LANE`` is an
+    integer division baked into the Metal source), so ``head_dim`` must be a
+    positive multiple of the simdgroup width. GQA fan-out is likewise baked
+    as the integer ``NUM_Q_HEADS / NUM_KV_HEADS``. Callers must check this
+    before any batch reaches device work; the kernel entry points also raise
+    on it as a last-resort defense.
+    """
+    if head_dim <= 0 or head_dim % _SIMD_SIZE != 0:
+        return (
+            f"head_dim {head_dim} is not a positive multiple of the Metal "
+            f"simdgroup width {_SIMD_SIZE}"
+        )
+    if num_q_heads <= 0 or num_kv_heads <= 0:
+        return (
+            f"head counts must be positive, found {num_q_heads} query and "
+            f"{num_kv_heads} KV heads"
+        )
+    if num_q_heads % num_kv_heads != 0:
+        return (
+            f"{num_q_heads} query heads do not divide evenly over "
+            f"{num_kv_heads} KV heads"
+        )
+    return None
+
+
 def _kernel_header(spec) -> str:
     return f"""
 #define HEAD_DIM {spec.head_dim}
@@ -438,17 +470,13 @@ def radix_decode_deferred(
     """
     import mlx.core as mx
 
-    if (
-        spec.head_dim <= 0
-        or spec.head_dim % _SIMD_SIZE != 0
-        or spec.num_q_heads <= 0
-        or spec.num_kv_heads <= 0
-        or spec.num_q_heads % spec.num_kv_heads != 0
-    ):
-        raise RuntimeError(
-            "deferred decode requires positive heads, head_dim divisible by 32, "
-            "and num_q_heads divisible by num_kv_heads"
-        )
+    geometry_reject_reason = deferred_attention_reject_reason(
+        num_q_heads=spec.num_q_heads,
+        num_kv_heads=spec.num_kv_heads,
+        head_dim=spec.head_dim,
+    )
+    if geometry_reject_reason is not None:
+        raise RuntimeError(f"deferred decode: {geometry_reject_reason}")
     if scale is None:
         scale = spec.attention_scale
     if not all(
@@ -553,17 +581,13 @@ def radix_prefill_deferred(
     """Run packed causal prefill without materializing the complete KV pool."""
     import mlx.core as mx
 
-    if (
-        spec.head_dim <= 0
-        or spec.head_dim % _SIMD_SIZE != 0
-        or spec.num_q_heads <= 0
-        or spec.num_kv_heads <= 0
-        or spec.num_q_heads % spec.num_kv_heads != 0
-    ):
-        raise RuntimeError(
-            "deferred prefill requires positive heads, head_dim divisible by 32, "
-            "and num_q_heads divisible by num_kv_heads"
-        )
+    geometry_reject_reason = deferred_attention_reject_reason(
+        num_q_heads=spec.num_q_heads,
+        num_kv_heads=spec.num_kv_heads,
+        head_dim=spec.head_dim,
+    )
+    if geometry_reject_reason is not None:
+        raise RuntimeError(f"deferred prefill: {geometry_reject_reason}")
     if scale is None:
         scale = spec.attention_scale
     arrays = (
@@ -650,6 +674,7 @@ def radix_prefill_deferred(
 
 __all__ = [
     "DeferredAttentionSpec",
+    "deferred_attention_reject_reason",
     "radix_decode_deferred",
     "radix_prefill_deferred",
 ]

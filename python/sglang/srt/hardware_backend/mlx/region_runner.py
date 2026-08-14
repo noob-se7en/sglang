@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import math
 import time
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -61,6 +62,86 @@ def _nontrivial_logits_reason(model: Any) -> Optional[str]:
     return None
 
 
+def _kernel_contract_reject_reason(model_runner: Any) -> Optional[str]:
+    """Why the region's Metal kernels cannot serve this model, or None.
+
+    The exported executor templates one uniform (query heads, KV heads,
+    head dim) attention spec from the KV pool, bakes ``head_dim ** -0.5`` as
+    the attention scale, and commits stacked per-layer K/V deltas in
+    bfloat16. A model outside that contract must be rejected before any
+    batch reaches device work: the kernel entry points raise at dispatch,
+    which would crash serving instead of falling back.
+    """
+    from sglang.kernels.ops.attention.mlx_radix_attention import (
+        deferred_attention_reject_reason,
+    )
+    from sglang.srt.hardware_backend.mlx.export_validation import (
+        ensure_model_layers,
+    )
+    from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
+
+    try:
+        ensure_model_layers(model_runner)
+    except RuntimeError as error:
+        # The topology resolver raises one explicit, actionable error naming
+        # the model class; surface it as the pre-launch rejection reason.
+        return str(error)
+    if not model_runner.attention_layers:
+        return "no attention layers discovered in the decoder layer stack"
+    kv_geometries = set()
+    for layer_id, layer in enumerate(model_runner.attention_layers):
+        if not isinstance(layer, RadixAttention):
+            return (
+                f"layer {layer_id} is not a plain RadixAttention layer; "
+                "hybrid attention stacks are not implemented by the region"
+            )
+        if layer.attn_type != AttentionType.DECODER or layer.is_cross_attention:
+            return f"layer {layer_id} is not decoder self-attention"
+        if layer.sliding_window_size > 0:
+            return f"layer {layer_id} uses sliding-window attention"
+        if layer.logit_cap:
+            return f"layer {layer_id} applies attention logit capping"
+        if layer.qk_head_dim != layer.head_dim or layer.v_head_dim != layer.head_dim:
+            return (
+                f"layer {layer_id} uses split QK/V head dims "
+                f"({layer.qk_head_dim}/{layer.v_head_dim}); the kernels "
+                "assume one head_dim"
+            )
+        geometry_reason = deferred_attention_reject_reason(
+            num_q_heads=layer.tp_q_head_num,
+            num_kv_heads=layer.tp_k_head_num,
+            head_dim=layer.head_dim,
+        )
+        if geometry_reason is not None:
+            return f"attention kernel cannot serve layer {layer_id}: {geometry_reason}"
+        if not math.isclose(layer.scaling, layer.head_dim**-0.5, rel_tol=1e-6):
+            return (
+                f"layer {layer_id} scales attention by {layer.scaling} but "
+                f"the kernels bake head_dim ** -0.5 "
+                f"({layer.head_dim**-0.5:.6g})"
+            )
+        kv_geometries.add((layer.tp_k_head_num, layer.head_dim))
+    if len(kv_geometries) > 1:
+        return (
+            "KV geometry differs across layers; the stacked KV-delta commit "
+            f"requires one shape, found {sorted(kv_geometries)}"
+        )
+    pool = model_runner.token_to_kv_pool
+    k_cache, _ = pool.get_kv_buffer(pool.start_layer)
+    if k_cache.dtype != torch.bfloat16 or model_runner.dtype != torch.bfloat16:
+        return (
+            "region kernels require bfloat16 activations and KV pools, found "
+            f"model dtype {model_runner.dtype} and KV dtype {k_cache.dtype}"
+        )
+    kv_geometry = next(iter(kv_geometries))
+    if tuple(k_cache.shape[1:]) != kv_geometry:
+        return (
+            f"KV pool row shape {tuple(k_cache.shape[1:])} does not match "
+            f"the attention layers' (KV heads, head_dim) {kv_geometry}"
+        )
+    return None
+
+
 class MlxRegionRunner(BaseRunner):
     """Decode-only graph runner backed by the exported MLX region."""
 
@@ -84,6 +165,13 @@ class MlxRegionRunner(BaseRunner):
             # sliding-window model would be silently wrong, not slow.
             self._model_reject_reason = (
                 "sliding-window attention is not implemented by the region"
+            )
+        if self._model_reject_reason is None:
+            # The Metal kernels raise at dispatch on geometry or dtype they
+            # do not support; reject at startup so no batch reaches device
+            # work with the contract unsatisfied.
+            self._model_reject_reason = _kernel_contract_reject_reason(
+                model_runner
             )
         if self._model_reject_reason is not None:
             logger.warning(

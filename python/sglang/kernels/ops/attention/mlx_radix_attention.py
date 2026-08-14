@@ -2,6 +2,7 @@
 
 from sglang.kernels.ops.attention._deferred_radix_attention_mlx import (
     DeferredAttentionSpec,
+    deferred_attention_reject_reason,
     radix_decode_deferred,
     radix_prefill_deferred,
 )
@@ -37,6 +38,7 @@ def causal_gqa(
 __all__ = [
     "DeferredAttentionSpec",
     "causal_gqa",
+    "deferred_attention_reject_reason",
     "radix_decode_deferred",
     "radix_prefill_deferred",
 ]
