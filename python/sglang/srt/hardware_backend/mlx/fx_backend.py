@@ -9,6 +9,7 @@ contract.
 
 from __future__ import annotations
 
+import math
 import operator
 import json
 from collections.abc import Sequence
@@ -122,7 +123,9 @@ class MlxFxLoweringRegistry:
             (torch.ops.aten.embedding.default, "embedding"),
             (torch.ops.aten.empty_like.default, "empty_like"),
             (torch.ops.aten.flatten.using_ints, "flatten"),
+            (torch.ops.aten.gelu.default, "gelu"),
             (torch.ops.aten.index_select.default, "index_select"),
+            (torch.ops.aten.layer_norm.default, "layer_norm"),
             (torch.ops.aten.linear.default, "linear"),
             (torch.ops.aten.matmul.default, "matmul"),
             (torch.ops.aten.mean.dim, "mean"),
@@ -130,11 +133,14 @@ class MlxFxLoweringRegistry:
             (torch.ops.aten.numpy_T.default, "numpy_transpose"),
             (torch.ops.aten.pow.Tensor_Scalar, "power"),
             (torch.ops.aten.reshape.default, "reshape"),
+            (torch.ops.aten.relu.default, "relu"),
             (torch.ops.aten.rms_norm.default, "rms_norm"),
             (torch.ops.aten.rsqrt.default, "rsqrt"),
             (torch.ops.aten.scaled_dot_product_attention.default, "sdpa"),
             (torch.ops.aten.silu.default, "silu"),
             (torch.ops.aten.sigmoid.default, "sigmoid"),
+            (torch.ops.aten.stack.default, "stack"),
+            (torch.ops.aten.tanh.default, "tanh"),
             (torch.ops.aten.add.Tensor, "add"),
             (torch.ops.aten.mul.Tensor, "multiply"),
             (torch.ops.aten.slice.Tensor, "slice"),
@@ -217,6 +223,20 @@ def _lower_mlx_node(
         if epsilon is None:
             epsilon = mx.finfo(value.dtype).eps
         return mx.fast.rms_norm(value, weight, float(epsilon))
+    if lowering == "layer_norm":
+        value, normalized_shape = args[:2]
+        weight = args[2] if len(args) > 2 else kwargs.get("weight")
+        bias = args[3] if len(args) > 3 else kwargs.get("bias")
+        epsilon = args[4] if len(args) > 4 else kwargs.get("eps", 1e-5)
+        if (
+            len(normalized_shape) != 1
+            or normalized_shape[0] != value.shape[-1]
+        ):
+            raise UnsupportedMlxFxGraphError(
+                "MLX layer_norm only normalizes the last axis, found "
+                f"normalized_shape={tuple(normalized_shape)}"
+            )
+        return mx.fast.layer_norm(value, weight, bias, float(epsilon))
     if lowering == "linear":
         value, weight = args[:2]
         bias = args[2] if len(args) > 2 else kwargs.get("bias")
@@ -262,6 +282,32 @@ def _lower_mlx_node(
         return mx.sigmoid(args[0]) * args[0]
     if lowering == "sigmoid":
         return mx.sigmoid(args[0])
+    if lowering == "relu":
+        return mx.maximum(args[0], 0)
+    if lowering == "gelu":
+        value = args[0]
+        approximate = kwargs.get("approximate", "none")
+        if approximate == "tanh":
+            return (
+                0.5
+                * value
+                * (
+                    1
+                    + mx.tanh(
+                        sqrt(2 / math.pi) * (value + 0.044715 * value**3)
+                    )
+                )
+            )
+        if approximate != "none":
+            raise UnsupportedMlxFxGraphError(
+                f"unsupported GELU approximation: {approximate}"
+            )
+        return value * 0.5 * (1 + mx.erf(value / sqrt(2)))
+    if lowering == "tanh":
+        return mx.tanh(args[0])
+    if lowering == "stack":
+        axis = args[1] if len(args) > 1 else kwargs.get("dim", 0)
+        return mx.stack(tuple(args[0]), axis=axis)
     if lowering == "getitem":
         return args[0][args[1]]
     if lowering == "add":
