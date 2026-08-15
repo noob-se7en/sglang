@@ -1,4 +1,4 @@
-"""Low-memory A/B benchmark for Qwen3-0.6B MPS elementwise providers.
+"""Low-memory A/B benchmark for the MPS elementwise operator providers.
 
 The benchmark keeps the exact production tensor contracts and synchronizes
 the MPS device around every repeated block.  Provider order is rotated in
@@ -7,7 +7,7 @@ or command-buffer position.
 
 Run::
 
-    python benchmark/kernels/elementwise/bench_qwen3_mps_ops.py
+    python benchmark/kernels/elementwise/bench_mps_elementwise_ops.py
 """
 
 from __future__ import annotations

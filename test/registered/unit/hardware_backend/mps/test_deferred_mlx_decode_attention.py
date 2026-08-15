@@ -1,4 +1,4 @@
-"""Small-memory checks for MLX deferred-commit Qwen3 decode attention."""
+"""Small-memory checks for the MLX deferred-commit decode attention kernel."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ _HAS_SUPPORTED_RUNTIME = (
 
 
 @unittest.skipUnless(_HAS_SUPPORTED_RUNTIME, "requires Torch 2.13 and MLX on MPS")
-class TestQwen3MlxDeferredDecode(unittest.TestCase):
+class TestMlxDeferredDecodeSmallMemory(unittest.TestCase):
     def test_two_long_sequences_match_torch(self):
         import mlx.core as mx
 
