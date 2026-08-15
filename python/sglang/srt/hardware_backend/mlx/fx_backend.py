@@ -608,8 +608,10 @@ def _make_mlx_export_executor(
             num_kv_heads=int(k_pools[0].shape[1]),
             head_dim=int(k_pools[0].shape[2]),
         )
-    out_cache_position = 4
-    prefix_lens_position = 6
+    from sglang.srt.hardware_backend.mlx.export_validation import ServingForwardArg
+
+    out_cache_position = ServingForwardArg.OUT_CACHE_LOC
+    prefix_lens_position = ServingForwardArg.EXTEND_PREFIX_LENS
     debug_attention = bool(os.environ.get("SGLANG_MLX_EXPORT_DEBUG_ATTENTION"))
 
     def make_mlx_graph(prefill_attention: str):
@@ -726,7 +728,10 @@ def _make_mlx_export_executor(
     # kernel; the plain-causal fast path is only valid for one request with
     # no cached prefix, so it exists only for batch-size-1 exports.
     causal_prefill_graph = None
-    if mode == "prefill" and example_inputs[2].shape[0] == 1:
+    if (
+        mode == "prefill"
+        and example_inputs[ServingForwardArg.REQ_POOL_INDICES].shape[0] == 1
+    ):
         causal_prefill_graph = mx.compile(make_mlx_graph("causal"), shapeless=False)
 
     def execute(*runtime_inputs):

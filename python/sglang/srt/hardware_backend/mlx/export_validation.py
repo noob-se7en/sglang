@@ -12,6 +12,7 @@ import json
 import os
 from collections import Counter
 from dataclasses import dataclass
+from enum import IntEnum
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -218,24 +219,46 @@ class ServingForwardExportWrapper(torch.nn.Module):
         )
 
 
+class ServingForwardArg(IntEnum):
+    """Positions in the flat serving-forward signature.
+
+    ``serving_forward_args`` builds its tuple in this member order, so the
+    enum is the single source of truth for the signature layout. Consumers
+    that index runtime inputs (the MLX executor's ``out_cache_loc`` and
+    ``extend_prefix_lens`` reads) must use these names, never literals.
+    """
+
+    INPUT_IDS = 0
+    POSITIONS = 1
+    REQ_POOL_INDICES = 2
+    SEQ_LENS = 3
+    OUT_CACHE_LOC = 4
+    EXTEND_SEQ_LENS = 5
+    EXTEND_PREFIX_LENS = 6
+    EXTEND_START_LOC = 7
+    NUM_TOKEN_NON_PADDED = 8
+
+
 def serving_forward_args(forward_batch: ForwardBatch) -> tuple[Any, ...]:
     """The flat tensor signature shared by export, validation, and serving.
 
     Order is load-bearing: the exported program's placeholders and the MLX
-    executor's ``out_cache_loc`` position are derived from it, so every
-    caller must build the tuple through this function.
+    executor's runtime-input reads are derived from it, so every caller must
+    build the tuple through this function, whose layout follows
+    :class:`ServingForwardArg`.
     """
-    return (
-        forward_batch.input_ids,
-        forward_batch.positions,
-        forward_batch.req_pool_indices,
-        forward_batch.seq_lens,
-        forward_batch.out_cache_loc,
-        forward_batch.extend_seq_lens,
-        forward_batch.extend_prefix_lens,
-        forward_batch.extend_start_loc,
-        forward_batch.num_token_non_padded,
-    )
+    values = {
+        ServingForwardArg.INPUT_IDS: forward_batch.input_ids,
+        ServingForwardArg.POSITIONS: forward_batch.positions,
+        ServingForwardArg.REQ_POOL_INDICES: forward_batch.req_pool_indices,
+        ServingForwardArg.SEQ_LENS: forward_batch.seq_lens,
+        ServingForwardArg.OUT_CACHE_LOC: forward_batch.out_cache_loc,
+        ServingForwardArg.EXTEND_SEQ_LENS: forward_batch.extend_seq_lens,
+        ServingForwardArg.EXTEND_PREFIX_LENS: forward_batch.extend_prefix_lens,
+        ServingForwardArg.EXTEND_START_LOC: forward_batch.extend_start_loc,
+        ServingForwardArg.NUM_TOKEN_NON_PADDED: forward_batch.num_token_non_padded,
+    }
+    return tuple(values[arg] for arg in ServingForwardArg)
 
 
 def ensure_model_layers(model_runner: Any) -> None:
