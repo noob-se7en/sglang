@@ -258,7 +258,12 @@ def serving_forward_args(forward_batch: ForwardBatch) -> tuple[Any, ...]:
         ServingForwardArg.EXTEND_START_LOC: forward_batch.extend_start_loc,
         ServingForwardArg.NUM_TOKEN_NON_PADDED: forward_batch.num_token_non_padded,
     }
-    return tuple(values[arg] for arg in ServingForwardArg)
+    ordered: list[Any] = [None] * len(ServingForwardArg)
+    for arg in ServingForwardArg:
+        # Index by member value, not declaration order, so reordering the
+        # enum declarations cannot silently permute the signature.
+        ordered[arg] = values[arg]
+    return tuple(ordered)
 
 
 def ensure_model_layers(model_runner: Any) -> None:

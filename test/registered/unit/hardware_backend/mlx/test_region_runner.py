@@ -14,8 +14,10 @@ from unittest import mock
 import torch
 
 from sglang.srt.hardware_backend.mlx.export_validation import (
+    ServingForwardArg,
     resolve_body_call_kwargs,
     resolve_decoder_topology,
+    serving_forward_args,
 )
 from sglang.srt.hardware_backend.mlx.region_runner import (
     _MAX_REGION_BATCH_SIZE,
@@ -450,6 +452,30 @@ class TestMissingLmHeadRejection(CustomTestCase):
         runner._model_reject_reason = reason
         self.assertFalse(runner.can_run_graph(_decode_batch()))
         self.assertFalse(runner.can_run_graph(_extend_batch()))
+
+
+class TestServingForwardArgLayout(CustomTestCase):
+    # The executor indexes runtime inputs by ServingForwardArg member VALUES,
+    # so the tuple layout must follow values regardless of how the enum
+    # declarations are ordered; these tests make the enum a genuine single
+    # source of truth for the signature.
+
+    def test_values_are_contiguous_positions(self):
+        self.assertEqual(
+            sorted(arg.value for arg in ServingForwardArg),
+            list(range(len(ServingForwardArg))),
+        )
+
+    def test_tuple_position_matches_member_value_and_field_name(self):
+        # Position arg.value must hold the ForwardBatch field named
+        # arg.name.lower(); sentinel strings make any permutation visible.
+        batch = SimpleNamespace(
+            **{arg.name.lower(): arg.name.lower() for arg in ServingForwardArg}
+        )
+        args = serving_forward_args(batch)
+        self.assertEqual(len(args), len(ServingForwardArg))
+        for arg in ServingForwardArg:
+            self.assertEqual(args[arg.value], arg.name.lower())
 
 
 if __name__ == "__main__":
