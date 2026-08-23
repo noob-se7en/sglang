@@ -32,6 +32,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _get_weight_update_device(device: str):
+    """Resolve devices that do not expose a CUDA-style current_device API."""
+    device_module = torch.get_device_module(device)
+    current_device = getattr(device_module, "current_device", None)
+    return current_device() if callable(current_device) else torch.device(device)
+
+
 def _unsupported_derived_weight_cache_error() -> Optional[str]:
     """Reject online weight updates that derived-weight caches cannot survive.
 
@@ -334,11 +341,10 @@ class WeightUpdater:
             )
 
         # We need to get device after patch otherwise the device would be wrong
-        device_module = torch.get_device_module(self.device)
-        infered_device = device_module.current_device()
+        inferred_device = _get_weight_update_device(self.device)
 
         named_tensors = [
-            (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
+            (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=inferred_device))
             for name, tensor in named_tensors
         ]
         if load_format == "direct":

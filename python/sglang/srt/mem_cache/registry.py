@@ -15,7 +15,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 
@@ -101,7 +100,7 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         logger.info("Using experimental C++ radix tree implementation.")
         return RadixCacheCpp(params=params, server_args=server_args)
 
-    if envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get() or use_mlx():
+    if envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
         return _create_unified_radix_cache(ctx, server_args, params)
 
     if ctx.is_hybrid_swa:
@@ -176,14 +175,6 @@ def _create_unified_radix_cache(
         tree_components.append(ComponentType.MAMBA)
 
     params.tree_components = tuple(tree_components)
-    if use_mlx() and ctx.is_hybrid_ssm:
-        from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
-            MlxAuxiliaryStateComponent,
-        )
-
-        params.component_registry_override = {
-            ComponentType.MAMBA: MlxAuxiliaryStateComponent,
-        }
     cache = UnifiedRadixCache(params)
     if ctx.enable_hierarchical_cache:
         cache.init_hicache(server_args, params)

@@ -155,7 +155,6 @@ class Qwen3Attention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
         self.alt_stream = alt_stream
-
         self.use_fused_qk_norm_mrope = (
             _has_fused_qk_norm_mrope
             and isinstance(self.rotary_emb, MRotaryEmbedding)
@@ -447,8 +446,6 @@ class Qwen3Model(Qwen2Model):
             decoder_layer_type=Qwen3DecoderLayer,
             alt_stream=alt_stream,
         )
-
-
 class Qwen3ForCausalLM(nn.Module):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [

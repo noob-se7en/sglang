@@ -50,22 +50,30 @@ else:
 
 from sglang.kernels.ops.grammar.token_filter_ops import set_token_filter_triton
 from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
+    apply_token_bitmask_inplace_torch,
     set_token_filter_torch,
 )
+from sglang.srt.platforms import current_platform
 
 logger = logging.getLogger(__name__)
 MAX_ROLLBACK_TOKENS = 200
 
 
-def _allocate_token_bitmask(vocab_size: int, batch_size: int) -> torch.Tensor:
-    # Always allocate a pinned bitmask so the later H2D to the device can be a
-    # genuine non_blocking copy (a pageable source silently downgrades it to a
-    # blocking copy).
+def _allocate_token_bitmask(
+    vocab_size: int, batch_size: int, device=None
+) -> torch.Tensor:
+    # CUDA uses pinned host storage for a genuine non-blocking H2D copy. MPS
+    # has unified memory and no pinned allocator, so pageable CPU storage is
+    # both the correct and cheaper ownership contract.
     return torch.full(
         get_bitmask_shape(batch_size, vocab_size),
         -1,
         dtype=bitmask_dtype,
-        pin_memory=True,
+        # This buffer is always host-owned.  Ask whether the active backend can
+        # pin host memory rather than inspecting ``device``: speculative
+        # verification deliberately builds the mask on CPU before an async H2D
+        # copy, so its ``device="cpu"`` argument must still pin on CUDA.
+        pin_memory=current_platform.is_pin_memory_available(),
     )
 
 
@@ -113,14 +121,17 @@ class XGrammarGrammar(BaseGrammarObject):
     def allocate_vocab_mask(
         self, vocab_size: int, batch_size: int, device
     ) -> torch.Tensor:
-        return _allocate_token_bitmask(vocab_size, batch_size)
+        return _allocate_token_bitmask(vocab_size, batch_size, device)
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         self.matcher.fill_next_token_bitmask(vocab_mask, idx)
 
     @staticmethod
     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
-        return vocab_mask.to(device, non_blocking=True)
+        return vocab_mask.to(
+            device,
+            non_blocking=current_platform.is_pin_memory_available(device),
+        )
 
     def apply_vocab_mask(self, logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
         if logits.device.type in {"cuda", "xpu", "musa"}:
@@ -132,6 +143,8 @@ class XGrammarGrammar(BaseGrammarObject):
             import sgl_kernel_npu  # noqa: F401
 
             torch.ops.npu.apply_token_bitmask(logits, vocab_mask)
+        elif logits.device.type in {"cpu", "mps"}:
+            apply_token_bitmask_inplace_torch(logits, vocab_mask)
         else:
             raise RuntimeError(f"Unsupported device: {logits.device.type}")
 
@@ -241,11 +254,14 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
 
     @staticmethod
     def allocate_vocab_mask(vocab_size: int, batch_size: int, device) -> torch.Tensor:
-        return _allocate_token_bitmask(vocab_size, batch_size)
+        return _allocate_token_bitmask(vocab_size, batch_size, device)
 
     @staticmethod
     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
-        return vocab_mask.to(device, non_blocking=True)
+        return vocab_mask.to(
+            device,
+            non_blocking=current_platform.is_pin_memory_available(device),
+        )
 
     @staticmethod
     def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
@@ -254,6 +270,8 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 apply_token_bitmask_inplace_cuda(logits, vocab_mask)
             else:
                 apply_token_bitmask_inplace_triton(logits, vocab_mask)
+        elif logits.device.type in {"cpu", "mps"}:
+            apply_token_bitmask_inplace_torch(logits, vocab_mask)
         else:
             raise RuntimeError(f"Unsupported device: {logits.device.type}")
 

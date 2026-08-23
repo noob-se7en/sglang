@@ -97,6 +97,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
+    precomputed_greedy_fallback_reason,
 )
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
@@ -236,7 +237,7 @@ if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
 
     init_npu_backend()
-elif current_platform.is_out_of_tree():
+elif current_platform.is_mps() or current_platform.is_out_of_tree():
     current_platform.init_backend()
 
 # Detect stragger ranks in model loading
@@ -346,7 +347,6 @@ class ModelRunner:
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
-
         self.init_startup_observability()
 
         self.init_remote_instance_weight_transporter()
@@ -380,8 +380,14 @@ class ModelRunner:
 
         # Set device early so that TransferEngine init (e.g. Ascend NPU)
         # can access the device context.
+        platform_matches_device = (
+            str(self.device).split(":", 1)[0] == current_platform.device_type
+        )
         try:
-            torch.get_device_module(self.device).set_device(ps.gpu_id)
+            if platform_matches_device:
+                current_platform.set_device(current_platform.get_device(ps.gpu_id))
+            else:
+                torch.get_device_module(self.device).set_device(ps.gpu_id)
         except Exception:
             import os
 
@@ -400,7 +406,11 @@ class ModelRunner:
         self.init_torch_distributed()
 
         # Init forward stream for overlap schedule
-        self.forward_stream = torch.get_device_module(self.device).Stream()
+        self.forward_stream = (
+            current_platform.create_stream(current_platform.get_device(ps.gpu_id))
+            if platform_matches_device
+            else torch.get_device_module(self.device).Stream()
+        )
 
         # WAR fast-path: a decode-graph forward publishes a fresh event here after
         # load_batch; the scheduler's WAR barrier waits on it (then clears it)
@@ -627,6 +637,7 @@ class ModelRunner:
         self.maybe_init_elastic_ep()
         self.init_token_oracle()
         self.sampler = create_sampler()
+
         self.load_model()
         prepare_moe_topk(
             model=self.model,
@@ -660,6 +671,18 @@ class ModelRunner:
         self.maybe_init_lora_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
+
+    def _configure_platform_model_execution(self, model: torch.nn.Module) -> None:
+        if str(self.device).split(":", 1)[0] != current_platform.device_type:
+            return
+
+        current_platform.configure_model_execution(
+            model=model,
+            model_config=self.model_config,
+            server_args=self.server_args,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool=self.token_to_kv_pool,
+        )
 
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -819,6 +842,8 @@ class ModelRunner:
             self.swa_max_total_num_tokens = result.swa_max_total_num_tokens
         # Keep a reference so the shared byte buffer is not GC'd.
         self._unified_memory_pool = result.unified_memory_pool
+
+        self._configure_platform_model_execution(self.model)
 
         self._init_post_memory_pool_components()
 
@@ -1607,6 +1632,7 @@ class ModelRunner:
         else:
             ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
         with ctx_mgr:
+            decode_graph_runner = self.decode_cuda_graph_runner
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph
                 if self.device == "cpu"
@@ -1614,8 +1640,8 @@ class ModelRunner:
             )
             can_run_graph = bool(
                 mode_check()
-                and self.decode_cuda_graph_runner
-                and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
+                and decode_graph_runner
+                and decode_graph_runner.can_run_graph(forward_batch)
             )
 
             if (
@@ -1626,9 +1652,9 @@ class ModelRunner:
                 self.hisparse_coordinator.wait_for_pending_backup()
                 self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
-            # Replay cuda graph if applicable
+            # Replay the active platform decode graph if applicable.
             if can_run_graph:
-                ret = self.decode_cuda_graph_runner.execute(
+                ret = decode_graph_runner.execute(
                     forward_batch,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
@@ -1726,22 +1752,45 @@ class ModelRunner:
         Returns:
             A list of next_token_ids
         """
-        self._preprocess_logits(logits_output, forward_batch.sampling_info)
+        precomputed = logits_output.precomputed_greedy_token_ids
+        if precomputed is not None:
+            if logits_output.next_token_logits is not None:
+                raise RuntimeError(
+                    "model output contained both logits and precomputed greedy tokens"
+                )
+            reason = precomputed_greedy_fallback_reason(forward_batch)
+            if reason is not None:
+                raise RuntimeError(
+                    "model returned precomputed greedy tokens for an ineligible "
+                    f"batch: {reason}"
+                )
+            next_token_ids = self.sampler.finalize_precomputed_greedy_token_ids(
+                precomputed,
+                forward_batch.sampling_info,
+                batch_size=forward_batch.batch_size,
+            )
+            # This field is a one-shot model-to-sampler payload.  The returned
+            # token tensor now owns the downstream lifetime; retaining the same
+            # DLPack-backed tensor on logits_output would keep the MLX producer
+            # storage alive through result queues for no semantic benefit.
+            logits_output.precomputed_greedy_token_ids = None
+        else:
+            self._preprocess_logits(logits_output, forward_batch.sampling_info)
 
-        # Sample the next tokens
-        next_token_ids = self.sampler(
-            logits_output,
-            forward_batch.sampling_info,
-            forward_batch.return_logprob,
-            forward_batch.top_logprobs_nums,
-            forward_batch.token_ids_logprobs,
-            # For prefill, we only use the position of the last token.
-            (
-                forward_batch.positions
-                if forward_batch.forward_mode.is_decode()
-                else forward_batch.seq_lens - 1
-            ),
-        )
+            # Sample the next tokens
+            next_token_ids = self.sampler(
+                logits_output,
+                forward_batch.sampling_info,
+                forward_batch.return_logprob,
+                forward_batch.top_logprobs_nums,
+                forward_batch.token_ids_logprobs,
+                # For prefill, we only use the position of the last token.
+                (
+                    forward_batch.positions
+                    if forward_batch.forward_mode.is_decode()
+                    else forward_batch.seq_lens - 1
+                ),
+            )
         self.ngram_embedding_manager.update_after_decode(
             next_token_ids=next_token_ids,
             forward_batch=forward_batch,
@@ -2045,8 +2094,6 @@ class ModelRunner:
         load_config: LoadConfig,
     ) -> None:
         self.model = new_model
-        # The record says what model this PROCESS serves; a draft's weight
-        # update is not that (its own state is on the runner).
         if not self.is_draft_worker:
             get_context().override(
                 "model_runner.update_model_fields",

@@ -192,6 +192,14 @@ def create_torch_native_backend(runner):
     return TorchNativeAttnBackend(runner)
 
 
+@register_attention_backend("mps")
+def create_mps_backend(runner):
+    """Create the Torch-native attention fallback for Apple MPS."""
+    from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
+
+    return TorchNativeAttnBackend(runner)
+
+
 @register_attention_backend("flex_attention")
 def create_flex_attention_backend(runner):
     from sglang.srt.layers.attention.torch_flex_backend import TorchFlexAttnBackend

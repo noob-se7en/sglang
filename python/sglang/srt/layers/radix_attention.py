@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
 from contextvars import ContextVar
 from enum import Enum
@@ -136,6 +137,10 @@ class RadixAttention(nn.Module):
         self.idx_k_scale_float = None
         self.idx_v_scale_float = None
         self.quant_method = None
+        # Optional platform/model-specific decode implementation.  It is a
+        # plain provider object selected during model initialization; the
+        # AttentionBackend remains responsible for Radix metadata and KV-pool
+        # ownership.
 
         if quant_config is not None:
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
@@ -168,7 +173,14 @@ class RadixAttention(nn.Module):
 
         context = get_tc_piecewise_forward_context()
         if (
-            forward_batch.forward_mode.is_extend()
+            (
+                forward_batch.forward_mode.is_extend()
+                # torch.export always traces the semantic attention op; the
+                # raw backend call is an eager-only shape.
+                or torch.compiler.is_exporting()
+                or os.environ.get("SGLANG_MLX_CAPTURE_REPORT")
+                or os.environ.get("SGLANG_MLX_EXPORT_VALIDATE")
+            )
             and context is not None
             # ``_force_eager_attn`` is only set inside Inkling's eager
             # norm+attn+sconv region, never during tc-piecewise capture. Reading
@@ -261,6 +273,24 @@ class RadixAttention(nn.Module):
                     if return_lse
                     else unified_attention_with_output
                 )
+            export_state = {}
+            if torch.compiler.is_exporting() or os.environ.get(
+                "SGLANG_MLX_EXPORT_VALIDATE"
+            ):
+                attn_backend = get_attn_backend()
+                k_cache, v_cache = attn_backend.token_to_kv_pool.get_kv_buffer(
+                    self.layer_id
+                )
+                export_state = {
+                    "k_cache": k_cache,
+                    "v_cache": v_cache,
+                    "req_to_token": attn_backend.req_to_token_pool.req_to_token,
+                    "req_pool_indices": forward_batch.req_pool_indices,
+                    "seq_lens": forward_batch.seq_lens,
+                    "out_cache_loc": forward_batch.out_cache_loc,
+                    "extend_prefix_lens": forward_batch.extend_prefix_lens,
+                    "extend_seq_lens": forward_batch.extend_seq_lens,
+                }
             lse = op(
                 q,
                 k,
@@ -270,6 +300,7 @@ class RadixAttention(nn.Module):
                 self.layer_id,
                 use_mha_companion=use_mha_companion,
                 key_value_num_tokens=key_value_num_tokens,
+                **export_state,
                 **kwargs,
             )
             if return_lse:
@@ -400,7 +431,7 @@ def _unified_attention_with_output_impl(
     return lse
 
 
-@register_custom_op(mutates_args=["output"])
+@register_custom_op(mutates_args=["output", "k_cache", "v_cache"])
 @register_split_op()
 def unified_attention_with_output(
     query: torch.Tensor,
@@ -419,6 +450,14 @@ def unified_attention_with_output(
     is_neox: Optional[bool] = None,
     llama_4_scaling: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
+    k_cache: Optional[torch.Tensor] = None,
+    v_cache: Optional[torch.Tensor] = None,
+    req_to_token: Optional[torch.Tensor] = None,
+    req_pool_indices: Optional[torch.Tensor] = None,
+    seq_lens: Optional[torch.Tensor] = None,
+    out_cache_loc: Optional[torch.Tensor] = None,
+    extend_prefix_lens: Optional[torch.Tensor] = None,
+    extend_seq_lens: Optional[torch.Tensor] = None,
 ) -> None:
     _unified_attention_with_output_impl(
         query,

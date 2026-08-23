@@ -21,9 +21,33 @@ GROUPS = K.ops.__all__
 
 # Representative ops checked as a subset (the registry holds many more).
 EXPECTED = {
-    "activation.silu_and_mul": {"aot", "jit", "aiter", "torch", "torch_compile"},
+    "activation.silu_and_mul": {
+        "aot",
+        "jit",
+        "aiter",
+        "metal_jit",
+        "torch",
+        "torch_compile",
+    },
     "activation.relu2": {"jit", "torch", "torch_compile"},
-    "layernorm.rmsnorm": {"aot", "jit", "aiter", "torch_npu", "torch", "torch_compile"},
+    "layernorm.rmsnorm": {
+        "aot",
+        "jit",
+        "metal_jit",
+        "aiter",
+        "torch_npu",
+        "torch",
+        "torch_compile",
+    },
+    "layernorm.fused_add_rmsnorm": {
+        "aot",
+        "jit",
+        "metal_jit",
+        "aiter",
+        "torch_npu",
+        "torch",
+        "torch_compile",
+    },
     "layernorm.gemma_rmsnorm": {"aot", "jit", "torch_npu", "torch", "torch_compile"},
     "gemm.fp8_scaled_mm": {"aot"},
     "moe.moe_align_block_size": {"aot", "jit"},
@@ -36,6 +60,7 @@ _CPU = PlatformInfo(device_type="cpu")
 _SM90 = PlatformInfo(device_type="cuda", cuda_arch_major=9, cuda_arch_minor=0)
 _SM100 = PlatformInfo(device_type="cuda", cuda_arch_major=10, cuda_arch_minor=0)
 _HIP = PlatformInfo(device_type="hip")
+_MPS = PlatformInfo(device_type="mps")
 
 
 def test_top_level_exports():
@@ -149,6 +174,8 @@ def test_per_op_backend_subset():
         (Cap.CUDA, _SM90, True),
         (Cap.CUDA, _HIP, False),
         (Cap.HIP, _HIP, True),
+        (Cap.MPS, _MPS, True),
+        (Cap.MPS, _CPU, False),
         (Cap.cuda(min_sm=(10, 0)), _SM90, False),
         (Cap.cuda(min_sm=(10, 0)), _SM100, True),
         (Cap.cuda(max_sm=(9, 0)), _SM100, False),
@@ -171,6 +198,7 @@ def test_capability_shortcuts():
     assert Cap.CUDA == Cap(device=DeviceType.CUDA)
     assert Cap.HIP == Cap(device=DeviceType.HIP)
     assert Cap.NPU == Cap(device=DeviceType.NPU)
+    assert Cap.MPS == Cap(device=DeviceType.MPS)
     assert {Cap.CUDA, Cap.HIP} == {Cap.HIP, Cap.CUDA}
     assert Cap.cuda(min_sm=(10, 0)) == Cap(
         device=DeviceType.CUDA, min_cuda_arch=(10, 0)
@@ -178,16 +206,19 @@ def test_capability_shortcuts():
 
 
 def test_platform_detect_does_not_raise():
-    assert PlatformInfo.detect().device_type in ("cpu", "cuda", "hip", "npu")
+    assert PlatformInfo.detect().device_type in ("cpu", "cuda", "hip", "npu", "mps")
 
 
 def test_import_stays_metadata_only():
     # Importing the namespace must not pull in the AOT backend (sgl_kernel) or
     # the JIT compilation infra (sglang.kernels.jit), which import torch / nvcc.
     code = (
-        "import sys, sglang.kernels.ops; "
-        "print('DIRTY' if 'sgl_kernel' in sys.modules or any("
-        "m.startswith('sglang.kernels.jit') for m in sys.modules) else 'CLEAN')"
+        "import sys, sglang; "
+        "before=set(sys.modules); "
+        "import sglang.kernels.ops; "
+        "loaded=set(sys.modules)-before; "
+        "print('DIRTY' if 'sgl_kernel' in loaded or any("
+        "m.startswith('sglang.kernels.jit') for m in loaded) else 'CLEAN')"
     )
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr

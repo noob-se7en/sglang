@@ -4,10 +4,7 @@
 from __future__ import annotations
 
 import builtins
-import inspect
-from typing import TYPE_CHECKING, Dict, Optional, Type
-
-import torch
+from typing import Dict, Type
 
 
 # Define empty classes as placeholders when vllm is not available
@@ -35,7 +32,6 @@ from sglang.srt.layers.quantization.gptq import (
     GPTQMarlinConfig,
 )
 from sglang.srt.layers.quantization.humming import HummingConfig
-from sglang.srt.layers.quantization.mlx import MlxQuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
@@ -59,14 +55,10 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_gfx95_supported,
-    is_mps,
     is_npu,
 )
 
 _is_gfx95_supported = is_gfx95_supported()
-
-if TYPE_CHECKING:
-    from sglang.srt.layers.moe.topk import TopKOutput
 
 # Base quantization methods
 BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
@@ -120,14 +112,6 @@ if is_npu():
         }
     )
 
-
-if is_mps():
-    BASE_QUANTIZATION_METHODS.update(
-        {
-            "mlx_q4": MlxQuantizationConfig,
-            "mlx_q8": MlxQuantizationConfig,
-        }
-    )
 
 # subset of above quant methods, supported on CPU
 CPU_QUANTIZATION_METHODS = {

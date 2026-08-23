@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Tuple, Union
 
@@ -45,6 +46,9 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
+from sglang.srt.model_executor.model_runner_components.layer_setup import (
+    compute_attention_and_moe_layers,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     enable_tc_piecewise_cuda_graph,
     set_tc_piecewise_forward_context,
@@ -70,6 +74,18 @@ class EagerRunner(BaseRunner):
     def __init__(self, model_runner: ModelRunner) -> None:
         super().__init__(model_runner)
         mr = model_runner
+        if (
+            os.environ.get("SGLANG_MLX_CAPTURE_REPORT")
+            or os.environ.get("SGLANG_MLX_EXPORT_VALIDATE")
+        ) and not hasattr(mr, "attention_layers"):
+            layer_model = getattr(mr.model, "model", mr.model)
+            (
+                mr.attention_layers,
+                mr.moe_layers,
+                mr.moe_fusions,
+                mr.dsa_indexers,
+                mr.mha_companion_layers,
+            ) = compute_attention_and_moe_layers(layer_model)
         sa = mr.server_args
         # Built first so the cg runners coalesce onto its buffers via the shared
         # input pool; size to the largest tokens/req across modes the worker hits.
@@ -240,7 +256,44 @@ class EagerRunner(BaseRunner):
 
         ctx = device_timer_ctx(model_runner.device_timer, "decode")
 
-        with ctx, pdmux_ctx:
+        compile_ctx = (
+            set_tc_piecewise_forward_context(
+                forward_batch,
+                model_runner.attention_layers,
+                getattr(model_runner.model, "quant_config", None),
+                model_runner.moe_layers,
+                model_runner.moe_fusions,
+                dsa_indexers=model_runner.dsa_indexers,
+                mha_companion_layers=model_runner.mha_companion_layers,
+                full_graph=True,
+            )
+            if (
+                os.environ.get("SGLANG_MLX_CAPTURE_REPORT")
+                or os.environ.get("SGLANG_MLX_EXPORT_VALIDATE")
+            )
+            else contextlib.nullcontext()
+        )
+        with ctx, pdmux_ctx, compile_ctx:
+            export_report = os.environ.get("SGLANG_MLX_EXPORT_VALIDATE")
+            validated_phases = getattr(
+                model_runner, "_mlx_serving_export_validated_phases", set()
+            )
+            if export_report and "decode" not in validated_phases:
+                from pathlib import Path
+
+                from sglang.srt.hardware_backend.mlx.export_validation import (
+                    export_serving_forward,
+                )
+
+                report_path = Path(export_report)
+                decode_report = report_path.with_name(
+                    f"{report_path.stem}.decode{report_path.suffix}"
+                )
+                export_serving_forward(
+                    model_runner, forward_batch, str(decode_report)
+                )
+                validated_phases.add("decode")
+                model_runner._mlx_serving_export_validated_phases = validated_phases
             return model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
@@ -297,7 +350,54 @@ class EagerRunner(BaseRunner):
             if forward_batch.forward_mode.is_target_verify()
             else "extend"
         )
-        with device_timer_ctx(model_runner.device_timer, category):
+        compile_ctx = (
+            set_tc_piecewise_forward_context(
+                forward_batch,
+                model_runner.attention_layers,
+                getattr(model_runner.model, "quant_config", None),
+                model_runner.moe_layers,
+                model_runner.moe_fusions,
+                dsa_indexers=model_runner.dsa_indexers,
+                mha_companion_layers=model_runner.mha_companion_layers,
+                full_graph=True,
+            )
+            if (
+                os.environ.get("SGLANG_MLX_CAPTURE_REPORT")
+                or os.environ.get("SGLANG_MLX_EXPORT_VALIDATE")
+            )
+            else contextlib.nullcontext()
+        )
+        with device_timer_ctx(model_runner.device_timer, category), compile_ctx:
+            export_report = os.environ.get("SGLANG_MLX_EXPORT_VALIDATE")
+            validated_phases = getattr(
+                model_runner, "_mlx_serving_export_validated_phases", set()
+            )
+            has_cached_prefix = bool(
+                forward_batch.extend_prefix_lens is not None
+                and torch.any(forward_batch.extend_prefix_lens != 0).cpu()
+            )
+            is_packed = forward_batch.req_pool_indices.numel() > 1
+            extend_variant = "extend"
+            if is_packed:
+                extend_variant += "_packed"
+            if has_cached_prefix:
+                extend_variant += "_cached_prefix"
+            if export_report and extend_variant not in validated_phases:
+                from pathlib import Path
+
+                from sglang.srt.hardware_backend.mlx.export_validation import (
+                    export_serving_forward,
+                )
+
+                report_path = Path(export_report)
+                extend_report = report_path.with_name(
+                    f"{report_path.stem}.{extend_variant}{report_path.suffix}"
+                )
+                export_serving_forward(
+                    model_runner, forward_batch, str(extend_report)
+                )
+                validated_phases.add(extend_variant)
+                model_runner._mlx_serving_export_validated_phases = validated_phases
             pcg_runner = model_runner.prefill_cuda_graph_runner
             if (
                 _is_hip

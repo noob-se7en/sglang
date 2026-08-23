@@ -48,6 +48,25 @@ class SRTPlatform(DeviceMixin):
         """
         pass
 
+    def configure_model_execution(
+        self,
+        *,
+        model,
+        model_config,
+        server_args,
+        req_to_token_pool,
+        token_to_kv_pool,
+    ) -> object | None:
+        """Configure platform execution after the concrete pools exist."""
+        return None
+
+    def supports_memory_pool_reallocation(self) -> bool:
+        """Whether a live runner may replace its concrete KV pools.
+
+        Platforms may return False when compiled execution borrows pool storage.
+        """
+        return True
+
     # ------------------------------------------------------------------
     # Subsystem factory methods
     # ------------------------------------------------------------------
