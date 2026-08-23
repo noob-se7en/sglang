@@ -163,6 +163,16 @@ class ServingForwardExportWrapper(torch.nn.Module):
         self._body_call_kwargs = resolve_body_call_kwargs(
             model, getattr(model, self._body_name)
         )
+        # ``LogitsProcessor`` narrows the lm_head's padded width back to the
+        # real vocabulary before sampling (``_copy_logits_to_buffer``). The
+        # region bypasses the processor entirely, so it has to apply the same
+        # narrowing: SGLang rounds the lm_head up to a multiple of 64 with
+        # zero rows, whose logit is exactly 0.0, and any row whose real logits
+        # are all negative would otherwise argmax onto a pad column and emit
+        # an out-of-vocabulary token id. Attribute access is deliberate --
+        # a model without a LogitsProcessor is already rejected before export
+        # by ``_nontrivial_logits_reason``.
+        self.vocab_size = model.logits_processor.vocab_size
         backend = model_runner.attn_backend
         self.register_buffer(
             "req_to_token",
@@ -213,10 +223,16 @@ class ServingForwardExportWrapper(torch.nn.Module):
                 for name, role in self._body_call_kwargs.items()
             }
         )
-        return torch.matmul(
+        logits = torch.matmul(
             hidden_states.to(self.model.lm_head.weight.dtype),
             self.model.lm_head.weight.T,
         )
+        # Mirrors LogitsProcessor's padded-vocab truncation; see __init__.
+        # Static shapes make this a trace-time branch, so an unpadded model
+        # exports the same graph it did before.
+        if logits.shape[-1] > self.vocab_size:
+            logits = logits[:, : self.vocab_size]
+        return logits
 
 
 class ServingForwardArg(IntEnum):

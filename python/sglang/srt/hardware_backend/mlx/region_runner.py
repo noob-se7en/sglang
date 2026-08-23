@@ -45,6 +45,16 @@ _MAX_REGION_BATCH_SIZE = 16
 # waste well below the region's kernel win.
 _PREFILL_TOKEN_BUCKETS = (128, 192, 256, 384, 512, 768, 1024, 1536, 2048)
 
+# Where a padded prefill token's K/V goes. Slot 0 is the pool's reserved
+# padding row: both allocators build their free list as ``arange(1, size + 1)``
+# under the comment "The padded slot 0 is used for writing dummy outputs from
+# padded tokens" (``mem_cache/allocator/token.py``, ``allocator/paged.py``),
+# and the pools carry a +1 row at index 0 for it. Any other index -- including
+# ``token_to_kv_pool.size``, which is in bounds because of that extra row --
+# is allocatable, so pad rows would overwrite a live request's K/V with no
+# error once the pool neared exhaustion.
+_PAD_SINK_SLOT = 0
+
 
 def _nontrivial_logits_reason(model: Any) -> Optional[str]:
     """Why the exported hidden @ lm_head.T shortcut would be wrong, or None.
@@ -262,13 +272,12 @@ class MlxRegionRunner(BaseRunner):
 
         Pad rows are causal-safe (appended after every real token), their
         RoPE positions repeat the last real position, and their K/V rows are
-        committed to the pool's reserved sink slot past the allocatable range.
+        committed to the pool's reserved padding slot ``_PAD_SINK_SLOT``.
         """
         num_tokens = forward_batch.input_ids.shape[0]
         pad = bucket - num_tokens
         if pad == 0:
             return forward_batch
-        sink_slot = self.model_runner.token_to_kv_pool.size
         return dataclasses.replace(
             forward_batch,
             input_ids=torch.cat(
@@ -286,7 +295,7 @@ class MlxRegionRunner(BaseRunner):
             out_cache_loc=torch.cat(
                 [
                     forward_batch.out_cache_loc,
-                    forward_batch.out_cache_loc.new_full((pad,), sink_slot),
+                    forward_batch.out_cache_loc.new_full((pad,), _PAD_SINK_SLOT),
                 ]
             ),
         )
