@@ -13,6 +13,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     prealloc_symmetric_memory_pool,
 )
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.mlx.region_runner import MlxRegionRunner
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.hardware_backend.xpu.graph_runner.xpu_graph_runner import XPUGraphRunner
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
@@ -180,7 +181,7 @@ def capture_cuda_graphs(
         capture_time=0,
     )
     if capture_decode_cuda_graph:
-        if model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu"):
+        if model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu", "mps"):
             decode = capture_decode_graph(model_runner=model_runner)
         elif (
             current_platform.is_out_of_tree() and current_platform.support_cuda_graph()
@@ -190,6 +191,18 @@ def capture_cuda_graphs(
         decode = GraphCapture(
             runner=eager_runner,
             memory_phase=decode_phase,
+            memory_usage_gb=0,
+            capture_time=0,
+        )
+
+    if model_runner.device == "mps" and decode.runner is not None:
+        # The MLX region is one runner for both phases (its can_run_graph
+        # dispatches on forward mode). Prefill has no device registry, so the
+        # decode registration is shared into the prefill slot; its export
+        # time and memory are already accounted to the decode capture.
+        prefill = GraphCapture(
+            runner=decode.runner,
+            memory_phase=prefill.memory_phase,
             memory_usage_gb=0,
             capture_time=0,
         )
@@ -251,6 +264,10 @@ def capture_prefill_graph(
             return result(eager_runner)
         return result(None)
 
+    if model_runner.device == "mps":
+        # Served by the MLX region registered for decode; capture_cuda_graphs
+        # shares that instance into the prefill slot after decode capture.
+        return result(None)
     # Draft models skip here during __init__; the eagle worker calls
     # this method explicitly (force_for_draft_worker=True) after
     # init_lm_head so graphs capture the final embedding weights.
@@ -473,6 +490,10 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
                 "cpu": CPUGraphRunner,
                 "npu": NPUGraphRunner,
                 "xpu": XPUGraphRunner,
+                # Not a device graph: the exported MLX region (torch.export +
+                # MLX lowering + mx.compile) padded onto cuda_graph_config's
+                # ladders, like the torch.compile CPU runner above.
+                "mps": MlxRegionRunner,
             },
         )
         runner = graph_runners[model_runner.device](model_runner)
