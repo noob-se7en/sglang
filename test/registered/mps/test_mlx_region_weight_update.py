@@ -21,9 +21,10 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.test.ci.ci_register import register_mps_ci
+from sglang.test.ci.ci_register import register_mlx_ci
 
-register_mps_ci(est_time=90, suite="stage-b-e2e-mps")
+# The Apple workflow dispatches the MLX suite; the test selects the region path.
+register_mlx_ci(est_time=90, suite="stage-b-e2e-mlx")
 
 
 def _observed_scheduler(*args, **kwargs):
