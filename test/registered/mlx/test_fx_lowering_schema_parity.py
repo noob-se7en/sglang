@@ -110,6 +110,33 @@ _RECIPES: dict[str, dict] = {
         extra=[lambda: ((_positive(4, 4), 0.5), {})],
     ),
     "reshape": dict(args=lambda: (_t(4, 6), [6, 4])),
+    "transpose": dict(
+        args=lambda: (_t(2, 3, 4), 0, 2),
+        extra=[lambda: ((_t(2, 3, 4), -1, 0), {})],
+    ),
+    "contiguous": dict(args=lambda: (_t(4, 6),)),
+    "permute": dict(
+        args=lambda: (_t(2, 3, 4), [2, 0, 1]),
+        extra=[lambda: ((_t(2, 3, 4), [-1, 0, 1]), {})],
+    ),
+    "expand": dict(
+        args=lambda: (_t(3, 1), [2, 3, 4]),  # adds a leading dim
+        extra=[lambda: ((_t(3, 1), [-1, 5]), {})],
+    ),
+    "squeeze_dim": dict(
+        args=lambda: (_t(3, 1, 4), 1),
+        extra=[
+            lambda: ((_t(3, 4), 0), {}),  # size is not 1: a no-op in Torch
+            lambda: ((_t(3, 1), -1), {}),
+        ],
+    ),
+    "select": dict(
+        args=lambda: (_t(3, 4, 5), 1, 2),
+        extra=[
+            lambda: ((_t(3, 4, 5), 1, -1), {}),
+            lambda: ((_t(3, 4, 5), -1, 0), {}),
+        ],
+    ),
     "sdpa": dict(
         args=lambda: (_t(2, 3, 5, 4), _t(2, 3, 5, 4), _t(2, 3, 5, 4)),
         pools={"is_causal": [True], "scale": [0.5]},
