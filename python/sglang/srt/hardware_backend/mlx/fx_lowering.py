@@ -260,6 +260,18 @@ def _lower_layer_norm(mx, args, kwargs):
     return mx.fast.layer_norm(value, weight, bias, float(epsilon))
 
 
+@_lowering("native_layer_norm", aten=(torch.ops.aten.native_layer_norm.default,))
+def _lower_native_layer_norm(mx, args, kwargs):
+    value, epsilon = args[0], args[4]
+    output = _lower_layer_norm(mx, args, kwargs)
+    # Torch returns the saved mean and rstd in the input dtype, keeping the
+    # normalized axis as size 1.
+    upcast = value.astype(mx.float32)
+    mean = mx.mean(upcast, axis=-1, keepdims=True)
+    rstd = mx.rsqrt(mx.var(upcast, axis=-1, keepdims=True) + epsilon)
+    return output, mean.astype(value.dtype), rstd.astype(value.dtype)
+
+
 @_lowering(
     "linear",
     aten=(torch.ops.aten.linear.default,),
@@ -272,9 +284,24 @@ def _lower_linear(mx, args, kwargs):
     return output if bias is None else output + bias
 
 
+@_lowering("batch_matmul", aten=(torch.ops.aten.bmm.default,))
 @_lowering("matmul", aten=(torch.ops.aten.matmul.default, torch.ops.aten.mm.default))
 def _lower_matmul(mx, args, kwargs):
     return args[0] @ args[1]
+
+
+@_lowering("addmm", aten=(torch.ops.aten.addmm.default,))
+def _lower_addmm(mx, args, kwargs):
+    bias, mat1, mat2 = args[:3]
+    beta = kwargs.get("beta", 1)
+    alpha = kwargs.get("alpha", 1)
+    product = mat1 @ mat2
+    if alpha != 1:
+        product = alpha * product
+    # Torch ignores self when beta is 0, so NaN or inf in it must not leak.
+    if beta == 0:
+        return product
+    return product + (bias if beta == 1 else beta * bias)
 
 
 @_lowering("mean", aten=(torch.ops.aten.mean.dim,))
@@ -467,6 +494,15 @@ def _lower_flatten(mx, args, kwargs):
     return mx.reshape(value, shape)
 
 
+@_lowering("index", aten=(torch.ops.aten.index.Tensor,))
+def _lower_index(mx, args, kwargs):
+    value, indices = args[:2]
+    if any(index is not None and index.dtype == mx.bool_ for index in indices):
+        # A mask selects a data-dependent number of elements.
+        raise UnsupportedMlxFxGraphError("MLX has no boolean-mask indexing")
+    return value[tuple(slice(None) if index is None else index for index in indices)]
+
+
 @_lowering("index_select", aten=(torch.ops.aten.index_select.default,))
 def _lower_index_select(mx, args, kwargs):
     return mx.take(args[0], args[2], axis=args[1])
@@ -490,6 +526,13 @@ def _lower_rsqrt(mx, args, kwargs):
 @_lowering("to_dtype", aten=(torch.ops.aten.to.dtype,))
 def _lower_to_dtype(mx, args, kwargs):
     return args[0].astype(_mlx_dtype(args[1], mx))
+
+
+@_lowering("to_copy", aten=(torch.ops.aten._to_copy.default,))
+def _lower_to_copy(mx, args, kwargs):
+    # MLX has one device and no memory formats, so only the dtype matters.
+    dtype = kwargs.get("dtype")
+    return args[0] if dtype is None else args[0].astype(_mlx_dtype(dtype, mx))
 
 
 @_lowering("unsqueeze", aten=(torch.ops.aten.unsqueeze.default,))

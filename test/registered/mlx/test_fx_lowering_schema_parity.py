@@ -92,10 +92,26 @@ _RECIPES: dict[str, dict] = {
     "tanh": dict(args=lambda: (_t(4, 4),)),
     "rsqrt": dict(args=lambda: (_positive(4, 4),)),
     "index_select": dict(args=lambda: (_t(5, 6), 1, _indices(3, 6))),
+    "index": dict(
+        args=lambda: (_t(5, 6), [_indices(3, 5)]),
+        extra=[
+            lambda: ((_t(5, 6), [None, _indices(4, 6)]), {}),
+            lambda: ((_t(5, 6), [_indices(3, 5), _indices(3, 6)]), {}),
+            # Non-adjacent index tensors move the indexed dim to the front.
+            lambda: ((_t(3, 4, 5), [_indices(2, 3), None, _indices(2, 5)]), {}),
+            lambda: ((_t(5, 6), [torch.tensor([-1, 0, -5])]), {}),
+        ],
+        rejects=[lambda: ((_t(5, 6), [torch.rand(5) > 0.5]), {})],
+    ),
     "layer_norm": dict(
         args=lambda: (_t(4, 8), [8]),
         pools={"weight": [_t(8)], "bias": [_t(8)], "eps": [1e-3]},
         rejects=[lambda: ((_t(4, 8), [4, 8]), {})],  # not last-axis only
+    ),
+    "native_layer_norm": dict(
+        args=lambda: (_t(4, 8), [8], None, None, 1e-5),
+        extra=[lambda: ((_t(2, 3, 8), [8], _t(8), _t(8), 1e-3), {})],
+        rejects=[lambda: ((_t(4, 8), [4, 8], None, None, 1e-5), {})],
     ),
     "rms_norm": dict(
         args=lambda: (_t(4, 8), [8], _t(8)),
@@ -103,6 +119,19 @@ _RECIPES: dict[str, dict] = {
     ),
     "linear": dict(args=lambda: (_t(3, 8), _t(5, 8)), pools={"bias": [_t(5)]}),
     "matmul": dict(args=lambda: (_t(3, 4), _t(4, 5))),
+    "batch_matmul": dict(args=lambda: (_t(2, 3, 4), _t(2, 4, 5))),
+    "addmm": dict(
+        args=lambda: (_t(3, 5), _t(3, 4), _t(4, 5)),
+        pools={"beta": [0, 0.5], "alpha": [2, 0.5]},
+        extra=[
+            lambda: ((_t(5), _t(3, 4), _t(4, 5)), {}),  # broadcast bias
+            # beta=0 must drop self entirely, NaN included.
+            lambda: (
+                (torch.full((3, 5), float("nan")), _t(3, 4), _t(4, 5)),
+                {"beta": 0},
+            ),
+        ],
+    ),
     "mean": dict(args=lambda: (_t(3, 4, 5), [1]), exclude={"dtype"}),
     "numpy_transpose": dict(args=lambda: (_t(3, 4),)),
     "power": dict(
@@ -117,6 +146,10 @@ _RECIPES: dict[str, dict] = {
     ),
     "slice": dict(args=lambda: (_t(4, 8), 1, 1, -1), pools={"step": [2]}),
     "to_dtype": dict(args=lambda: (_t(4, 4), torch.float16), exclude={"non_blocking"}),
+    "to_copy": dict(
+        args=lambda: (_t(4, 4),),
+        pools={"dtype": [torch.float16, torch.int32]},
+    ),
     "unsqueeze": dict(args=lambda: (_t(3, 4), 1)),
 }
 
