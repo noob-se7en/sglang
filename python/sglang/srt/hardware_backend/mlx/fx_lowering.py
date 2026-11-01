@@ -390,7 +390,10 @@ def _lower_getitem(mx, args, kwargs):
     return args[0][args[1]]
 
 
+# The Scalar overloads get their own names: the parity test keys one recipe per
+# name, and the Scalar schemas reject a tensor ``other``.
 @_lowering("add", aten=(torch.ops.aten.add.Tensor,), functions=(operator.add,))
+@_lowering("add_scalar", aten=(torch.ops.aten.add.Scalar,))
 def _lower_add(mx, args, kwargs):
     alpha = _arg(args, kwargs, 2, "alpha", 1)
     if alpha == 1:
@@ -399,11 +402,19 @@ def _lower_add(mx, args, kwargs):
 
 
 @_lowering("multiply", aten=(torch.ops.aten.mul.Tensor,), functions=(operator.mul,))
+@_lowering("multiply_scalar", aten=(torch.ops.aten.mul.Scalar,))
 def _lower_multiply(mx, args, kwargs):
     return args[0] * args[1]
 
 
+@_lowering("divide", aten=(torch.ops.aten.div.Tensor,))
+@_lowering("divide_scalar", aten=(torch.ops.aten.div.Scalar,))
+def _lower_divide(mx, args, kwargs):
+    return args[0] / args[1]
+
+
 @_lowering("subtract", aten=(torch.ops.aten.sub.Tensor,))
+@_lowering("subtract_scalar", aten=(torch.ops.aten.sub.Scalar,))
 def _lower_subtract(mx, args, kwargs):
     alpha = _arg(args, kwargs, 2, "alpha", 1)
     if alpha == 1:
@@ -485,6 +496,26 @@ def _lower_power(mx, args, kwargs):
 @_lowering("rsqrt", aten=(torch.ops.aten.rsqrt.default,))
 def _lower_rsqrt(mx, args, kwargs):
     return mx.rsqrt(args[0])
+
+
+@_lowering("sqrt", aten=(torch.ops.aten.sqrt.default,))
+def _lower_sqrt(mx, args, kwargs):
+    return mx.sqrt(args[0])
+
+
+@_lowering("cos", aten=(torch.ops.aten.cos.default,))
+def _lower_cos(mx, args, kwargs):
+    return mx.cos(args[0])
+
+
+@_lowering("sin", aten=(torch.ops.aten.sin.default,))
+def _lower_sin(mx, args, kwargs):
+    return mx.sin(args[0])
+
+
+@_lowering("negative", aten=(torch.ops.aten.neg.default,))
+def _lower_negative(mx, args, kwargs):
+    return mx.negative(args[0])
 
 
 @_lowering("to_dtype", aten=(torch.ops.aten.to.dtype,))
